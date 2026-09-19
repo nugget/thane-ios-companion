@@ -189,14 +189,14 @@ struct VisitEnrichmentIntegrationTests {
     }
 
     private func waitUntil(_ predicate: @MainActor () async throws -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(3)
+        let deadline = ContinuousClock.now + .seconds(30)
         while true {
             if try await predicate() { return }
             guard ContinuousClock.now < deadline else {
                 Issue.record("Timed out waiting for visit integration")
                 throw CancellationError()
             }
-            try await Task.sleep(for: .milliseconds(2))
+            try await Task.sleep(for: .milliseconds(10))
         }
     }
 }

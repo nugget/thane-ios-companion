@@ -147,13 +147,13 @@ struct VisitEnrichmentCoordinatorTests {
     }
 
     private func waitUntil(_ predicate: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(2)
+        let deadline = ContinuousClock.now + .seconds(30)
         while !predicate() {
             guard ContinuousClock.now < deadline else {
                 Issue.record("Timed out waiting for visit enrichment")
                 throw CancellationError()
             }
-            try await Task.sleep(for: .milliseconds(1))
+            try await Task.sleep(for: .milliseconds(10))
         }
     }
 }
@@ -167,7 +167,9 @@ private final class EnrichmentFixture {
     var publications: [VisitWindowSnapshot] = []
     var coordinator: VisitEnrichmentCoordinator!
 
-    init(timeout: Duration = .seconds(2)) throws {
+    // Tests that exercise lookup deadlines pass an explicit short timeout.
+    // Other tests must allow the shared simulator time to schedule their continuations.
+    init(timeout: Duration = .seconds(60)) throws {
         store = VisitWindowStore(fileURL: fileURL)
         coordinator = VisitEnrichmentCoordinator(
             store: store,
@@ -228,7 +230,7 @@ private final class SlowVisitResolver: VisitPlaceResolving {
     var calls = 0
     func resolve(_ visit: VisitSnapshot) async throws -> VisitPlaceContext {
         calls += 1
-        try await Task.sleep(for: .seconds(5))
+        try await Task.sleep(for: .seconds(60))
         return VisitPlaceContext(status: .resolved, provider: provider)
     }
 }

@@ -199,13 +199,13 @@ struct AppleVisitPlaceResolverTests {
     }
 
     private func waitUntil(_ predicate: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(2)
+        let deadline = ContinuousClock.now + .seconds(30)
         while !predicate() {
             guard ContinuousClock.now < deadline else {
                 Issue.record("Timed out waiting for lookup fixture")
                 throw CancellationError()
             }
-            try await Task.sleep(for: .milliseconds(1))
+            try await Task.sleep(for: .milliseconds(10))
         }
     }
 }

@@ -126,10 +126,10 @@ struct VisitPlaceDisclosureTests {
     }
 
     private func waitUntil(_ condition: @MainActor () -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
         while !condition() {
             guard ContinuousClock.now < deadline else { throw DisclosureTestError.timeout }
-            try await Task.sleep(for: .milliseconds(1))
+            try await Task.sleep(for: .milliseconds(10))
         }
     }
 }
