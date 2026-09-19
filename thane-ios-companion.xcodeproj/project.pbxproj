@@ -346,7 +346,7 @@
 				INFOPLIST_FILE = "thane-ios-companion/Info.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Thane connects to an operator-configured agent that may run on the local network.";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Thane can publish significant location changes, and a history of places you stayed with arrival and departure times, to your connected agent in the background. Each is a separate switch in the app and both are off until you turn them on.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Thane can share location changes and visit history with your connected agent in the background. Separate switches default off. In this development build, optional Visit Place Details also sends visit coordinates to Apple Maps for addresses and nearby businesses, then shares those results with your agent.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Thane shares a location with your connected agent only when you enable Location sharing.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Thane reads metadata from recent visible photos only when you enable Recent Photo Metadata for your connected agent.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;

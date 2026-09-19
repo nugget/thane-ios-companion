@@ -106,9 +106,12 @@ final class VisitEnrichmentCoordinator {
                     placeCandidates: result.placeCandidates,
                     attribution: result.attribution,
                     truncated: result.truncated,
-                    failureReason: result.failureReason
+                    failureReason: result.failureReason,
+                    searchRadiusMeters: result.searchRadiusMeters,
+                    partial: result.partial
                 )
-                if status == .resolved || status == .noMatch { lastError = nil }
+                lastError = status == .unavailable || result.partial
+                    ? "Some place details were unavailable. The original visit is still shared." : nil
             } catch {
                 guard permitsCompletion(scope: scope, generation: generation) else { return }
                 // Network diagnostics can contain coordinates or credentials.

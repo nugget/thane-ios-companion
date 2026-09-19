@@ -2,6 +2,12 @@ import Foundation
 import os
 import UIKit
 
+nonisolated enum VisitObservationDisclosure {
+    case withdrawn
+    case raw
+    case enriched
+}
+
 @Observable
 @MainActor
 final class ObservationPublisher {
@@ -9,6 +15,9 @@ final class ObservationPublisher {
     private(set) var lastPublishedAt: Date?
     private(set) var lastError: String?
     private(set) var isUploading = false
+
+    /// Evaluated again at delivery, including for events restored from disk.
+    @ObservationIgnored var visitDisclosure: @MainActor () -> VisitObservationDisclosure = { .raw }
 
     private let logger = Logger(
         subsystem: "info.nugget.thane-ios-companion",
@@ -84,10 +93,40 @@ final class ObservationPublisher {
             isUploading = false
             return
         }
+        prepareOutbox(for: deliveryScope)
+    }
+
+    /// Stop current and inherited uploads before replacing queued private
+    /// detail. The replacement receives a new identity so Thane accepts it
+    /// even if an earlier enriched body arrived but its acknowledgement did not.
+    func reconcileVisitDisclosure() {
+        uploadTask?.cancel()
+        uploadTask = nil
+        uploadID = nil
+        preparationTask?.cancel()
+        preparedScope = nil
+        flushRequestedWhileBusy = false
+        isUploading = false
+        guard let deliveryScope else { return }
+        prepareOutbox(for: deliveryScope)
+    }
+
+    private func prepareOutbox(for deliveryScope: ObservationDeliveryScope) {
+        let previousPreparation = preparationTask
         preparationTask = Task { [weak self] in
             guard let self else { return }
             do {
+                // Serialize cleanup across rapid consent or destination changes.
+                await previousPreparation?.value
+                try Task.checkCancellation()
+                if visitDisclosure() != .enriched {
+                    await uploader.cancelAllTransfers()
+                    try Task.checkCancellation()
+                }
                 let discardedCount = try await outbox.bind(to: deliveryScope)
+                try Task.checkCancellation()
+                guard self.deliveryScope == deliveryScope else { return }
+                _ = try await sanitizedPendingEvents(for: deliveryScope)
                 try Task.checkCancellation()
                 guard self.deliveryScope == deliveryScope else { return }
                 preparedScope = deliveryScope
@@ -274,12 +313,12 @@ final class ObservationPublisher {
             defer { enqueueTasks[taskID] = nil }
             do {
                 try Task.checkCancellation()
-                let event = try makeEvent()
+                let original = try makeEvent()
+                let event = sanitizedVisitEvent(original) ?? original
                 try Task.checkCancellation()
                 try await outbox.enqueue(event, for: deliveryScope)
                 try Task.checkCancellation()
                 guard self.deliveryScope == deliveryScope else { return }
-                preparedScope = deliveryScope
                 lastError = nil
                 await refreshPendingCount(for: deliveryScope)
                 flush()
@@ -318,7 +357,8 @@ final class ObservationPublisher {
         var completedBatch = false
 
         do {
-            let events = try await outbox.pending(for: deliveryScope)
+            let events = try await sanitizedPendingEvents(for: deliveryScope)
+            try Task.checkCancellation()
             if !events.isEmpty {
                 guard authorizationExpiresAt > Date(),
                       self.authorizationExpiresAt == authorizationExpiresAt else {
@@ -335,6 +375,7 @@ final class ObservationPublisher {
                     osVersion: UIDevice.current.systemVersion,
                     events: Array(events.prefix(16))
                 )
+                try Task.checkCancellation()
                 _ = try await uploader.upload(batch, to: baseURL, token: token)
                 try Task.checkCancellation()
                 try await outbox.removeSent(Set(batch.events.map(\.eventID)), for: deliveryScope)
@@ -385,6 +426,48 @@ final class ObservationPublisher {
                 record(error)
             }
         }
+    }
+
+    private func sanitizedPendingEvents(for scope: ObservationDeliveryScope) async throws -> [ObservationEvent] {
+        while true {
+            let events = try await outbox.pending(for: scope)
+            try Task.checkCancellation()
+            guard let visit = events.first(where: { $0.kind == .visits }),
+                  let replacement = sanitizedVisitEvent(visit) else { return events }
+            _ = try await outbox.replacePending(replacement, replacing: visit.eventID, for: scope)
+            try Task.checkCancellation()
+        }
+    }
+
+    /// Returns nil when the event already satisfies the current disclosure.
+    private func sanitizedVisitEvent(_ event: ObservationEvent) -> ObservationEvent? {
+        guard event.kind == .visits, event.status == .available else { return nil }
+        let disclosure = visitDisclosure()
+        guard disclosure != .enriched else { return nil }
+
+        var payload = event.payload?.value as? [String: Any]
+        var changed = false
+        if disclosure == .raw,
+           var visits = payload?["visits"] as? [[String: Any]] {
+            for index in visits.indices {
+                if visits[index].removeValue(forKey: "place_context") != nil { changed = true }
+            }
+            guard changed else { return nil }
+            payload?["visits"] = visits
+        } else {
+            // A malformed persisted payload cannot be safely partially disclosed.
+            payload = nil
+        }
+
+        let originalMilliseconds = ceil(event.observedAt.timeIntervalSince1970 * 1_000)
+        let proposed = max(Date(), Date(timeIntervalSince1970: (originalMilliseconds + 1) / 1_000))
+        let observedAt = nextVisitPublicationDate(proposed: proposed)
+        guard var payload else { return .withdrawn(kind: .visits, observedAt: observedAt) }
+        payload["captured_at"] = ObservationCoding.dateString(from: observedAt)
+        return ObservationEvent(
+            eventID: UUID(), kind: .visits, schemaVersion: event.schemaVersion,
+            status: .available, observedAt: observedAt, payload: AnyCodable(payload)
+        )
     }
 
     private func authorizePrivatePublish() -> Bool {

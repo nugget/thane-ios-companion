@@ -20,10 +20,18 @@ final class AgentProfile: Identifiable {
     let conversationStore: ConversationStore
     let inboxStore: InboxStore
 
+    @ObservationIgnored lazy var visitEnrichment = VisitEnrichmentCoordinator(
+        store: visitWindow,
+        currentScope: { [weak self] in self?.visitEnrichmentScope },
+        publish: { [weak self] window in self?.publishVisits(window) }
+    )
+
     var tokenInput: String = ""
     private(set) var configurationError: String?
 
     private let systemContextService: SystemContextService
+    private let visitPlaceResolver: (any VisitPlaceResolving)?
+    private var configuredVisitEnrichmentScope: String?
     private var identityRefreshDeadlineTask: Task<Void, Never>?
 
     /// Builds a profile whose every collaborator is wired to the same storage
@@ -45,7 +53,13 @@ final class AgentProfile: Identifiable {
         identityPinning: IdentityPinningService? = nil,
         conversationStore: ConversationStore = ConversationStore(),
         inboxStore: InboxStore? = nil,
-        photoLibrary: (any PhotoLibraryReading)? = nil
+        photoLibrary: (any PhotoLibraryReading)? = nil,
+        visitWindow: VisitWindowStore? = nil,
+        locationManager: any LocationManaging = CLLocationManager(),
+        visitPlaceResolver: (any VisitPlaceResolving)? = nil,
+        locationAuthorizationSessionFactory: @escaping @MainActor () -> any LocationAuthorizationSession = {
+            CLServiceSession(authorization: .always)
+        }
     ) {
         let identityPinning = identityPinning ?? IdentityPinningService(
             connectionID: connectionSettings.connectionID
@@ -57,12 +71,14 @@ final class AgentProfile: Identifiable {
         // Sourced unconditionally from the settings object so no collaborator
         // can address a different SHA-256 storage directory than another.
         let profileID = connectionSettings.profileID
-        let visitWindow = VisitWindowStore(profileID: profileID)
+        let visitWindow = visitWindow ?? VisitWindowStore(profileID: profileID)
         let observationPublisher = observationPublisher ?? ObservationPublisher(
             outbox: ObservationOutbox(profileID: profileID),
             uploader: URLSessionObservationUploader(profileID: profileID)
         )
         self.visitWindow = visitWindow
+        self.visitPlaceResolver = PrivateCapabilities.appleMapsVisitEnrichmentAvailable
+            ? visitPlaceResolver ?? AppleVisitPlaceResolver() : nil
         self.id = profileID
         self.connectionSettings = connectionSettings
         self.sharingPreferences = sharingPreferences
@@ -75,12 +91,18 @@ final class AgentProfile: Identifiable {
             connectionSettings.bindPairwiseClientID(to: pinnedCounterpartyID)
         }
         sharingPreferences.scope(to: identityPinning.pin?.identityID)
+        if !PrivateCapabilities.appleMapsVisitEnrichmentAvailable {
+            sharingPreferences.visitEnrichmentEnabled = false
+        }
         self.inboxStore.scope(to: identityPinning.pin?.identityID)
 
         let connection = ServerConnection()
         let router = PlatformServiceRouter()
         let systemService = SystemContextService(preferences: sharingPreferences)
-        let locationService = LocationService(preferences: sharingPreferences)
+        let locationService = LocationService(
+            preferences: sharingPreferences, manager: locationManager,
+            authorizationSessionFactory: locationAuthorizationSessionFactory
+        )
         let photoService = PhotoService(
             preferences: sharingPreferences,
             library: photoLibrary ?? SystemPhotoLibraryReader(),
@@ -92,6 +114,16 @@ final class AgentProfile: Identifiable {
         systemContextService = systemService
         self.locationService = locationService
         self.photoService = photoService
+        if locationService.authorizationStatus != .authorizedAlways {
+            sharingPreferences.visitEnrichmentEnabled = false
+        }
+        observationPublisher.visitDisclosure = { [weak self] in
+            guard let self,
+                  self.sharingPreferences.locationEnabled,
+                  self.sharingPreferences.visitsEnabled else { return .withdrawn }
+            return PrivateCapabilities.appleMapsVisitEnrichmentAvailable && self.sharingPreferences.visitEnrichmentEnabled
+                ? .enriched : .raw
+        }
 
         locationService.onSignificantLocation = { [weak self, weak observationPublisher] snapshot in
             observationPublisher?.publishLocation(snapshot)
@@ -100,12 +132,16 @@ final class AgentProfile: Identifiable {
         locationService.onBackgroundLocationUnavailable = { [weak observationPublisher] in
             observationPublisher?.withdraw(.location)
         }
-        locationService.onVisit = { [weak self, weak observationPublisher] visit in
+        locationService.onVisit = { [weak self] visit in
             guard let self else { return }
-            observationPublisher?.publishVisits(visitWindow.record(visit))
+            publishVisits(visitWindow.record(visit))
+            resumeVisitEnrichment()
             refreshIdentityOpportunistically()
         }
         locationService.onVisitMonitoringUnavailable = { [weak self, weak observationPublisher] in
+            self?.invalidateVisitEnrichment()
+            self?.sharingPreferences.visitEnrichmentEnabled = false
+            observationPublisher?.reconcileVisitDisclosure()
             self?.visitWindow.discardAll()
             observationPublisher?.withdraw(.visits)
         }
@@ -186,6 +222,10 @@ final class AgentProfile: Identifiable {
             configurationError = error.localizedDescription
         }
         configureObservationPublisher()
+        if !sharingPreferences.visitEnrichmentEnabled {
+            removeVisitPlaceContext()
+        }
+        resumeVisitEnrichment()
     }
 
     var statusTitle: String {
@@ -288,6 +328,7 @@ final class AgentProfile: Identifiable {
 
     func activate() {
         locationService.restoreBackgroundMonitoringIfAuthorized()
+        resumeVisitEnrichment()
         photoService.refreshAuthorizationStatus()
         // A foreground transition must revalidate the current endpoint and
         // token before either transport can release private data.
@@ -298,6 +339,7 @@ final class AgentProfile: Identifiable {
     }
 
     func enterBackground() {
+        invalidateVisitEnrichment()
         cancelIdentityRefreshDeadline()
         connection.disconnect()
     }
@@ -374,6 +416,7 @@ final class AgentProfile: Identifiable {
     }
 
     func forgetThane() async {
+        invalidateVisitEnrichment()
         configurationError = nil
         cancelIdentityRefreshDeadline()
         connectionSettings.isEnabled = false
@@ -394,6 +437,7 @@ final class AgentProfile: Identifiable {
     }
 
     func removeConnection() async {
+        invalidateVisitEnrichment()
         configurationError = nil
         cancelIdentityRefreshDeadline()
         connectionSettings.isEnabled = false
@@ -455,11 +499,13 @@ final class AgentProfile: Identifiable {
             configurationError = "Pin this agent before changing what is shared with it."
             return
         }
+        if !enabled { invalidateVisitEnrichment() }
         if !enabled, sharingPreferences.backgroundLocationEnabled {
             locationService.setBackgroundMonitoringEnabled(false)
             observationPublisher.withdraw(.location)
         }
         sharingPreferences.locationEnabled = enabled
+        observationPublisher.reconcileVisitDisclosure()
         if enabled {
             locationService.requestWhenInUseAuthorizationIfNeeded()
         } else {
@@ -485,13 +531,83 @@ final class AgentProfile: Identifiable {
             configurationError = "Pin this agent before changing what is shared with it."
             return
         }
+        if !enabled { invalidateVisitEnrichment() }
         locationService.setVisitMonitoringEnabled(enabled)
+        observationPublisher.reconcileVisitDisclosure()
         if !enabled {
             // Erase the on-device window as well as withdrawing, so nothing
             // remains here to republish if it is switched back on.
             visitWindow.discardAll()
             observationPublisher.withdraw(.visits)
         }
+    }
+
+    func setVisitEnrichment(enabled: Bool) {
+        guard let scope = sharingPreferences.counterpartyID,
+              scope == identityPinning.pin?.identityID else {
+            configurationError = "Pin this agent before changing what is shared with it."
+            return
+        }
+        configurationError = nil
+        invalidateVisitEnrichment()
+        sharingPreferences.visitEnrichmentEnabled = enabled
+            && PrivateCapabilities.appleMapsVisitEnrichmentAvailable
+            && locationService.authorizationStatus == .authorizedAlways
+        observationPublisher.reconcileVisitDisclosure()
+        if sharingPreferences.visitEnrichmentEnabled {
+            resumeVisitEnrichment()
+        } else {
+            removeVisitPlaceContext()
+            if enabled, locationService.authorizationStatus != .authorizedAlways {
+                configurationError = "Enable Visit History with Always location permission before turning on place details."
+            }
+        }
+    }
+
+    private var visitEnrichmentScope: String? {
+        guard PrivateCapabilities.appleMapsVisitEnrichmentAvailable,
+              sharingPreferences.visitEnrichmentEnabled,
+              sharingPreferences.locationEnabled, sharingPreferences.visitsEnabled,
+              locationService.authorizationStatus == .authorizedAlways,
+              identityContinuity != .mismatch,
+              let scope = sharingPreferences.counterpartyID,
+              scope == identityPinning.pin?.identityID else { return nil }
+        return scope
+    }
+
+    private func resumeVisitEnrichment() {
+        guard let scope = visitEnrichmentScope, let visitPlaceResolver else {
+            invalidateVisitEnrichment()
+            return
+        }
+        if configuredVisitEnrichmentScope == scope {
+            visitEnrichment.resume()
+        } else {
+            configuredVisitEnrichmentScope = scope
+            visitEnrichment.configure(scope: scope, resolver: visitPlaceResolver)
+        }
+    }
+
+    private func invalidateVisitEnrichment() {
+        configuredVisitEnrichmentScope = nil
+        visitEnrichment.invalidate()
+    }
+
+    private func removeVisitPlaceContext() {
+        do {
+            publishVisits(try visitWindow.removePlaceContext())
+        } catch {
+            // Reads and publications also strip context, even if disk cleanup fails.
+            configurationError = "Saved place details could not be removed. Place detail sharing is off."
+            publishVisits(visitWindow.window().withoutPlaceContext())
+        }
+    }
+
+    private func publishVisits(_ window: VisitWindowSnapshot) {
+        guard sharingPreferences.locationEnabled, sharingPreferences.visitsEnabled else { return }
+        let includePlaceContext = PrivateCapabilities.appleMapsVisitEnrichmentAvailable
+            && sharingPreferences.visitEnrichmentEnabled
+        observationPublisher.publishVisits(includePlaceContext ? window : window.withoutPlaceContext())
     }
 
     func setPhotoSharing(enabled: Bool) async {
@@ -618,6 +734,7 @@ final class AgentProfile: Identifiable {
     }
 
     private func applySharingScope(_ counterpartyID: String?) {
+        invalidateVisitEnrichment()
         // The window was gathered for the previous counterparty. Scoped by
         // profile rather than by counterparty, it would otherwise carry across
         // the boundary the rest of this method exists to enforce.
@@ -625,9 +742,14 @@ final class AgentProfile: Identifiable {
         locationService.suspendForCounterpartyChange()
         photoService.suspendForCounterpartyChange()
         sharingPreferences.scope(to: counterpartyID)
+        if !PrivateCapabilities.appleMapsVisitEnrichmentAvailable {
+            sharingPreferences.visitEnrichmentEnabled = false
+        }
+        observationPublisher.reconcileVisitDisclosure()
         systemContextService.setNetworkObservationEnabled(sharingPreferences.networkEnabled)
         systemContextService.setDeviceObservationEnabled(sharingPreferences.deviceEnabled)
         locationService.restoreBackgroundMonitoringIfAuthorized()
+        resumeVisitEnrichment()
     }
 
     private func refreshIdentityForConfiguredConnection() {
@@ -640,6 +762,7 @@ final class AgentProfile: Identifiable {
     }
 
     private func reconcileIdentityBoundary() {
+        resumeVisitEnrichment()
         guard connectionSettings.isEnabled else {
             configureObservationPublisher()
             return

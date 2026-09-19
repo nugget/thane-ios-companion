@@ -141,6 +141,12 @@ struct SharingView: View {
                 }
                 .disabled(profile.locationService.authorizationStatus == .notDetermined)
 
+                if PrivateCapabilities.appleMapsVisitEnrichmentAvailable,
+                   profile.sharingPreferences.visitsEnabled {
+                    Divider()
+                    visitPlaceDetails
+                }
+
                 Divider()
 
                 OperationalRow(
@@ -166,6 +172,41 @@ struct SharingView: View {
                     .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var visitPlaceDetails: some View {
+        Toggle(isOn: Binding(
+            get: { profile.sharingPreferences.visitEnrichmentEnabled },
+            set: { profile.setVisitEnrichment(enabled: $0) }
+        )) {
+            PreferenceLabel(
+                title: "Visit Place Details",
+                detail: "Sends recent and new visit coordinates to Apple Maps for street addresses and nearby businesses, then shares the results with \(counterparty.displayName), which keeps what it receives. Nearby businesses are possible matches; distances are straight-line estimates. Lookups are best effort and need no additional location permission. Available in development builds."
+            )
+        }
+        .disabled(!canEditSharing)
+
+        if profile.sharingPreferences.visitEnrichmentEnabled {
+            if profile.visitEnrichment.isResolving {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Looking up visit places…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let error = profile.visitEnrichment.lastError {
+                Label(error, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let mapsURL = URL(string: "https://maps.apple.com") {
+                Link("Place data from Apple Maps", destination: mapsURL)
+                    .font(.caption)
             }
         }
     }
@@ -221,7 +262,7 @@ struct SharingView: View {
         AppCard {
             Label("Controlled on this iPhone", systemImage: "hand.raised.fill")
                 .font(.headline)
-            Text("Every source defaults off for \(counterparty.displayName). \(counterparty.displayName) cannot grant itself access or trigger an Apple permission prompt. Enabled data is sent only after current evidence matches this iPhone's identity pin, through the authenticated companion connection or an approved event-driven upload.")
+            Text("Every source defaults off for \(counterparty.displayName). \(counterparty.displayName) cannot grant itself access or trigger an Apple permission prompt. Data shared with \(counterparty.displayName) is delivered only after current evidence matches this iPhone's identity pin, through the authenticated companion connection or an approved event-driven upload.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

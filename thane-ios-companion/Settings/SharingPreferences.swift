@@ -35,6 +35,7 @@ final class SharingPreferences {
     private nonisolated static let migrationKey = "sharing.scoped-migration-complete"
     private let defaults: UserDefaults
     private var isLoadingScope = false
+    private var storedVisitEnrichmentEnabled: Bool
 
     private(set) var counterpartyID: String?
 
@@ -48,7 +49,10 @@ final class SharingPreferences {
         didSet { persist(networkEnabled, key: SystemContextCategory.network.rawValue) }
     }
     var locationEnabled: Bool {
-        didSet { persist(locationEnabled, key: "location") }
+        didSet {
+            persist(locationEnabled, key: "location")
+            if !locationEnabled { visitEnrichmentEnabled = false }
+        }
     }
     var backgroundLocationEnabled: Bool {
         didSet { persist(backgroundLocationEnabled, key: "background-location") }
@@ -62,7 +66,17 @@ final class SharingPreferences {
     /// agreeing to a record of where time is spent, and bundling the two would
     /// be exactly the consent AGENTS.md forbids.
     var visitsEnabled: Bool {
-        didSet { persist(visitsEnabled, key: "visits") }
+        didSet {
+            persist(visitsEnabled, key: "visits")
+            if !visitsEnabled { visitEnrichmentEnabled = false }
+        }
+    }
+    var visitEnrichmentEnabled: Bool {
+        get { storedVisitEnrichmentEnabled && locationEnabled && visitsEnabled }
+        set {
+            storedVisitEnrichmentEnabled = newValue && locationEnabled && visitsEnabled
+            persist(storedVisitEnrichmentEnabled, key: "visit-enrichment")
+        }
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -75,6 +89,7 @@ final class SharingPreferences {
         backgroundLocationEnabled = false
         photosEnabled = false
         visitsEnabled = false
+        storedVisitEnrichmentEnabled = false
     }
 
     var enabledSystemCategories: Set<SystemContextCategory> {
@@ -117,6 +132,7 @@ final class SharingPreferences {
             backgroundLocationEnabled = false
             photosEnabled = false
             visitsEnabled = false
+            visitEnrichmentEnabled = false
             return
         }
 
@@ -144,6 +160,10 @@ final class SharingPreferences {
             for: "visits",
             counterpartyID: counterpartyID
         )
+        let storedVisitEnrichmentEnabled = storedValue(
+            for: "visit-enrichment",
+            counterpartyID: counterpartyID
+        )
         locationEnabled = storedLocationEnabled
         backgroundLocationEnabled = storedLocationEnabled
             && storedBackgroundLocationEnabled
@@ -151,6 +171,7 @@ final class SharingPreferences {
         // updates are: a child left armed under a revoked parent resumes
         // silently when the parent is re-enabled.
         visitsEnabled = storedLocationEnabled && storedVisitsEnabled
+        visitEnrichmentEnabled = visitsEnabled && storedVisitEnrichmentEnabled
         photosEnabled = storedValue(
             for: "photos",
             counterpartyID: counterpartyID
@@ -163,6 +184,9 @@ final class SharingPreferences {
         }
         if !storedLocationEnabled, storedVisitsEnabled {
             defaults.set(false, forKey: Self.scopedKey(counterpartyID, "visits"))
+        }
+        if !visitsEnabled, storedVisitEnrichmentEnabled {
+            defaults.set(false, forKey: Self.scopedKey(counterpartyID, "visit-enrichment"))
         }
     }
 
@@ -209,6 +233,7 @@ final class SharingPreferences {
         "background-location",
         "photos",
         "visits",
+        "visit-enrichment",
     ]
 
     private nonisolated static func legacyKey(_ suffix: String) -> String {

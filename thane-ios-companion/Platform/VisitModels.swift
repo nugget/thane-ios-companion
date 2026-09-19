@@ -108,6 +108,8 @@ nonisolated struct VisitPlaceContext: Codable, Equatable, Sendable {
     let provider: String?
     let attemptedAt: String?
     let resolvedAt: String?
+    let searchRadiusMeters: Double?
+    let partial: Bool
     private(set) var address: VisitPlaceAddress?
     private(set) var placeCandidates: [VisitPlaceCandidate]
     private(set) var attribution: [VisitPlaceAttribution]
@@ -119,12 +121,15 @@ nonisolated struct VisitPlaceContext: Codable, Equatable, Sendable {
         attemptedAt: String? = nil, resolvedAt: String? = nil,
         address: VisitPlaceAddress? = nil, placeCandidates: [VisitPlaceCandidate] = [],
         attribution: [VisitPlaceAttribution] = [], truncated: Bool = false,
-        failureReason: VisitPlaceContextFailureReason? = nil
+        failureReason: VisitPlaceContextFailureReason? = nil,
+        searchRadiusMeters: Double? = nil, partial: Bool = false
     ) {
         self.status = status
         self.provider = Self.shortened(provider, to: 80)
         self.attemptedAt = Self.shortened(attemptedAt, to: 40)
         self.resolvedAt = Self.shortened(resolvedAt, to: 40)
+        self.searchRadiusMeters = searchRadiusMeters.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        self.partial = partial
         self.address = address
         self.placeCandidates = Array(placeCandidates.prefix(Self.maxCandidates))
         self.attribution = attribution
@@ -135,7 +140,8 @@ nonisolated struct VisitPlaceContext: Codable, Equatable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case status, provider, address, attribution, truncated
+        case status, provider, address, attribution, truncated, partial
+        case searchRadiusMeters = "search_radius_meters"
         case attemptedAt = "attempted_at"
         case resolvedAt = "resolved_at"
         case placeCandidates = "place_candidates"
@@ -153,7 +159,9 @@ nonisolated struct VisitPlaceContext: Codable, Equatable, Sendable {
             placeCandidates: try values.decodeIfPresent([VisitPlaceCandidate].self, forKey: .placeCandidates) ?? [],
             attribution: try values.decodeIfPresent([VisitPlaceAttribution].self, forKey: .attribution) ?? [],
             truncated: try values.decodeIfPresent(Bool.self, forKey: .truncated) ?? false,
-            failureReason: try values.decodeIfPresent(VisitPlaceContextFailureReason.self, forKey: .failureReason)
+            failureReason: try values.decodeIfPresent(VisitPlaceContextFailureReason.self, forKey: .failureReason),
+            searchRadiusMeters: try values.decodeIfPresent(Double.self, forKey: .searchRadiusMeters),
+            partial: try values.decodeIfPresent(Bool.self, forKey: .partial) ?? false
         )
     }
 
@@ -402,6 +410,18 @@ nonisolated struct VisitWindowSnapshot: Codable, Equatable, Sendable {
     let returnedCount: Int
     let truncated: Bool
     let visits: [VisitSnapshot]
+
+    func withoutPlaceContext() -> VisitWindowSnapshot {
+        VisitWindowSnapshot(
+            capturedAt: capturedAt, windowHours: windowHours, maxEntries: maxEntries,
+            returnedCount: returnedCount, truncated: truncated,
+            visits: visits.map { visit in
+                var raw = visit
+                raw.placeContext = nil
+                return raw
+            }
+        )
+    }
 
     enum CodingKeys: String, CodingKey {
         case visits, truncated

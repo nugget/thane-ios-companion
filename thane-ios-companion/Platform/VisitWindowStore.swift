@@ -249,7 +249,7 @@ struct VisitsPlatformHandler: PlatformServiceHandler {
     let toolDefinitions = [
         PlatformToolDefinition.make(
             name: "ios_recent_visits",
-            description: "Recent places the operator lingered, with arrival and departure times, from the active iOS companion. Covers at most the last 48 hours and 16 visits. Works only after the operator enables Visit History in the app and grants iOS Always location permission. A visit still in progress has no departure time and a partial dwell. An arrival the system did not observe is reported as unknown rather than guessed.",
+            description: "Recent places the operator lingered, with arrival and departure times, from the active iOS companion. Covers at most the last 48 hours and 16 visits. Requires Visit History and iOS Always location permission. Ongoing visits have no departure and partial dwell; unobserved arrivals are unknown. Optional place_context contains separately enabled address lookups and nearby business candidates, never proof of a business visit. Candidate distance_meters is straight-line surface distance from the reported coordinate, not walking or driving distance. Preserve provider, timestamps, search radius, partial/truncated status, and location accuracy when interpreting results.",
             method: "get_recent_visits",
             tags: ["ios", "location", "read"],
             schemaJSON: """
@@ -279,7 +279,10 @@ struct VisitsPlatformHandler: PlatformServiceHandler {
         guard preferences.locationEnabled, preferences.visitsEnabled else {
             throw VisitsHandlerError.sharingDisabled
         }
-        return try AnyCodable.fromEncodable(store.window())
+        let window = store.window()
+        let includePlaceContext = PrivateCapabilities.appleMapsVisitEnrichmentAvailable
+            && preferences.visitEnrichmentEnabled
+        return try AnyCodable.fromEncodable(includePlaceContext ? window : window.withoutPlaceContext())
     }
 }
 
