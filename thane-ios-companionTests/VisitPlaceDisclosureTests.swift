@@ -108,6 +108,32 @@ struct VisitPlaceDisclosureTests {
         try await fixture.publisher.discardAllPending()
     }
 
+    @Test("Changing visit consent preserves an ordinary in-flight upload")
+    func ordinaryTransferSurvivesVisitRevocation() async throws {
+        let fixture = DisclosureFixture()
+        defer { fixture.cleanup() }
+        fixture.uploader.holdFirstUpload = true
+        fixture.publisher.visitDisclosure = { .enriched }
+        let event = ObservationEvent(
+            eventID: UUID(), kind: .location, schemaVersion: 1, status: .available,
+            observedAt: Date(), payload: AnyCodable(["latitude": 40.0])
+        )
+        try await fixture.outbox.enqueue(event, for: fixture.scope)
+        fixture.configure()
+        try await waitUntil { fixture.uploader.batches.count == 1 }
+
+        fixture.publisher.visitDisclosure = { .withdrawn }
+        fixture.publisher.reconcileVisitDisclosure()
+        try await waitUntil { fixture.uploader.cancellationCount == 1 }
+        #expect(fixture.publisher.isUploading)
+        #expect(fixture.uploader.batches.count == 1)
+        fixture.uploader.completeSuspendedUpload()
+        try await waitUntil { fixture.publisher.pendingCount == 0 && !fixture.publisher.isUploading }
+        #expect(fixture.uploader.batches.count == 1)
+        #expect(try await fixture.outbox.pending(for: fixture.scope).isEmpty)
+        try await fixture.publisher.discardAllPending()
+    }
+
     @Test("Sanitizing an old snapshot cannot overwrite a newer queued window")
     func replacementChecksCurrentEventIdentity() async throws {
         let fixture = DisclosureFixture()
@@ -196,6 +222,22 @@ private final class DisclosureUploader: ObservationUploading {
     func cancelAllTransfers() async {
         cancellationCount += 1
         suspendedUpload?.resume(throwing: CancellationError())
+        suspendedUpload = nil
+    }
+
+    func cancelTransfers(disallowedBy disclosure: VisitObservationDisclosure) async {
+        cancellationCount += 1
+        guard let batch = batches.last,
+              ObservationVisitTransferContent.shouldCancel(
+                taskDescription: ObservationVisitTransferContent(batch: batch).rawValue,
+                disallowedBy: disclosure
+              ) else { return }
+        suspendedUpload?.resume(throwing: CancellationError())
+        suspendedUpload = nil
+    }
+
+    func completeSuspendedUpload() {
+        suspendedUpload?.resume(returning: ObservationIngestResult(stored: 1, ignored: 0, receivedAt: Date()))
         suspendedUpload = nil
     }
 }

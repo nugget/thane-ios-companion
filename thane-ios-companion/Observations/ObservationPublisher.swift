@@ -2,7 +2,7 @@ import Foundation
 import os
 import UIKit
 
-nonisolated enum VisitObservationDisclosure {
+nonisolated enum VisitObservationDisclosure: Sendable {
     case withdrawn
     case raw
     case enriched
@@ -33,6 +33,7 @@ final class ObservationPublisher {
     private var preparedScope: ObservationDeliveryScope?
     private var uploadTask: Task<Void, Never>?
     private var uploadID: UUID?
+    private var activeTransferContent: ObservationVisitTransferContent?
     private var preparationTask: Task<Void, Never>?
     private var enqueueTasks: [UUID: Task<Void, Never>] = [:]
     private var flushRequestedWhileBusy = false
@@ -66,6 +67,7 @@ final class ObservationPublisher {
             uploadTask?.cancel()
             uploadTask = nil
             uploadID = nil
+            activeTransferContent = nil
             preparationTask?.cancel()
             preparedScope = nil
             flushRequestedWhileBusy = false
@@ -100,13 +102,21 @@ final class ObservationPublisher {
     /// detail. The replacement receives a new identity so Thane accepts it
     /// even if an earlier enriched body arrived but its acknowledgement did not.
     func reconcileVisitDisclosure() {
-        uploadTask?.cancel()
-        uploadTask = nil
-        uploadID = nil
+        let mayContinue = activeTransferContent.map {
+            !ObservationVisitTransferContent.shouldCancel(
+                taskDescription: $0.rawValue, disallowedBy: visitDisclosure()
+            )
+        } ?? false
+        if !mayContinue {
+            uploadTask?.cancel()
+            uploadTask = nil
+            uploadID = nil
+            activeTransferContent = nil
+            flushRequestedWhileBusy = false
+            isUploading = false
+        }
         preparationTask?.cancel()
         preparedScope = nil
-        flushRequestedWhileBusy = false
-        isUploading = false
         guard let deliveryScope else { return }
         prepareOutbox(for: deliveryScope)
     }
@@ -120,7 +130,7 @@ final class ObservationPublisher {
                 await previousPreparation?.value
                 try Task.checkCancellation()
                 if visitDisclosure() != .enriched {
-                    await uploader.cancelAllTransfers()
+                    await uploader.cancelTransfers(disallowedBy: visitDisclosure())
                     try Task.checkCancellation()
                 }
                 let discardedCount = try await outbox.bind(to: deliveryScope)
@@ -283,6 +293,7 @@ final class ObservationPublisher {
         preparedScope = nil
         uploadTask = nil
         uploadID = nil
+        activeTransferContent = nil
         preparationTask = nil
         flushRequestedWhileBusy = false
         isUploading = false
@@ -376,6 +387,7 @@ final class ObservationPublisher {
                     events: Array(events.prefix(16))
                 )
                 try Task.checkCancellation()
+                activeTransferContent = ObservationVisitTransferContent(batch: batch)
                 _ = try await uploader.upload(batch, to: baseURL, token: token)
                 try Task.checkCancellation()
                 try await outbox.removeSent(Set(batch.events.map(\.eventID)), for: deliveryScope)
@@ -399,10 +411,12 @@ final class ObservationPublisher {
         if self.deliveryScope == deliveryScope {
             await refreshPendingCount(for: deliveryScope)
         }
+        guard self.uploadID == uploadID else { return }
         let shouldFlushAgain = flushRequestedWhileBusy || completedBatch
         flushRequestedWhileBusy = false
         uploadTask = nil
         self.uploadID = nil
+        activeTransferContent = nil
         isUploading = false
         if shouldFlushAgain,
            pendingCount > 0,
@@ -487,6 +501,7 @@ final class ObservationPublisher {
         uploadTask?.cancel()
         uploadTask = nil
         uploadID = nil
+        activeTransferContent = nil
         flushRequestedWhileBusy = false
         isUploading = false
         baseURL = nil
