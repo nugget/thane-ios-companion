@@ -38,7 +38,16 @@ final class VisitWindowStore {
 
     private func restore() {
         guard let stored = try? load() else { return }
-        visits = stored.visits
+        // Older windows keyed stays by coordinates as well as arrival, so a
+        // refined departure could leave both versions on disk.
+        for visit in stored.visits {
+            if let key = visit.stayKey,
+               let index = visits.firstIndex(where: { $0.stayKey == key }) {
+                visits[index] = replacing(visits[index], with: visit)
+            } else {
+                visits.append(visit)
+            }
+        }
         lastDroppedAnchor = stored.lastDroppedAnchor
     }
 
@@ -49,15 +58,67 @@ final class VisitWindowStore {
     /// Location delivers both.
     @discardableResult
     func record(_ visit: VisitSnapshot, now: Date = Date()) -> VisitWindowSnapshot {
+        var recorded = visit
         // Replace only when both sides name the same stay. Matching on a nil
         // arrival would fold every missed-arrival visit into one, discarding
         // unrelated places that happen to share a coordinate.
         if let key = visit.stayKey {
+            if let existing = visits.first(where: { $0.stayKey == key }) {
+                recorded = replacing(existing, with: visit)
+            }
             visits.removeAll { $0.stayKey == key }
         }
-        visits.append(visit)
+        visits.append(recorded)
         prune(now: now)
         try? persist()
+        return window(now: now)
+    }
+
+    private func replacing(_ existing: VisitSnapshot, with incoming: VisitSnapshot) -> VisitSnapshot {
+        if existing.state == .settled, incoming.state == .ongoing { return existing }
+        var replacement = incoming
+        replacement.visitID = existing.visitID
+        replacement.placeContext = existing.hasSameLookupLocation(as: incoming)
+            ? existing.placeContext ?? incoming.placeContext
+            : nil
+        return replacement
+    }
+
+    func visit(id: UUID, now: Date = Date()) -> VisitSnapshot? {
+        window(now: now).visits.first { $0.visitID == id }
+    }
+
+    /// Apply an asynchronous result to the current entry, never the snapshot
+    /// that started the lookup: a departure may have arrived in the meantime.
+    @discardableResult
+    func applyPlaceContext(
+        _ context: VisitPlaceContext, to id: UUID,
+        expectedVisit: VisitSnapshot? = nil, now: Date = Date()
+    ) throws -> VisitWindowSnapshot? {
+        guard let current = visit(id: id, now: now),
+              expectedVisit.map({ current.hasSameLookupLocation(as: $0) }) ?? true,
+              let index = visits.firstIndex(where: { $0.visitID == id }) else {
+            return nil
+        }
+        let previous = visits[index].placeContext
+        visits[index].placeContext = context
+        do {
+            try persist()
+        } catch {
+            visits[index].placeContext = previous
+            throw error
+        }
+        return window(now: now)
+    }
+
+    /// Revoking enrichment preserves the original visits. Keep memory clear
+    /// even if persistence fails so the caller can prevent further exposure.
+    @discardableResult
+    func removePlaceContext(now: Date = Date()) throws -> VisitWindowSnapshot {
+        for index in visits.indices {
+            visits[index].placeContext = nil
+        }
+        try persist()
         return window(now: now)
     }
 

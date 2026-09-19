@@ -27,6 +27,7 @@ final class ObservationPublisher {
     private var preparationTask: Task<Void, Never>?
     private var enqueueTasks: [UUID: Task<Void, Never>] = [:]
     private var flushRequestedWhileBusy = false
+    private var lastVisitPublicationMilliseconds: Double?
 
     /// The uploader is required rather than defaulted: it owns a background
     /// URLSession whose identifier must be scoped to the same profile as the
@@ -62,6 +63,7 @@ final class ObservationPublisher {
             isUploading = false
         }
         if self.deliveryScope != deliveryScope {
+            lastVisitPublicationMilliseconds = nil
             for task in enqueueTasks.values {
                 task.cancel()
             }
@@ -137,15 +139,24 @@ final class ObservationPublisher {
     /// 2000-01-01 floor and would reject the entire batch — taking unrelated
     /// location and system-context events down with it.
     func publishVisits(_ window: VisitWindowSnapshot) {
-        guard let observedAt = ObservationCoding.date(from: window.capturedAt) else {
+        guard let capturedAt = ObservationCoding.date(from: window.capturedAt) else {
             lastError = "A visit window timestamp could not be encoded."
             return
         }
+        let observedAt = nextVisitPublicationDate(proposed: capturedAt)
+        let publishedWindow = VisitWindowSnapshot(
+            capturedAt: ObservationCoding.dateString(from: observedAt),
+            windowHours: window.windowHours,
+            maxEntries: window.maxEntries,
+            returnedCount: window.returnedCount,
+            truncated: window.truncated,
+            visits: window.visits
+        )
         enqueue {
             try ObservationEvent.available(
                 kind: .visits,
                 observedAt: observedAt,
-                payload: window
+                payload: publishedWindow
             )
         }
     }
@@ -167,7 +178,17 @@ final class ObservationPublisher {
     }
 
     func withdraw(_ kind: ObservationKind) {
-        enqueue { ObservationEvent.withdrawn(kind: kind) }
+        let observedAt = kind == .visits ? nextVisitPublicationDate(proposed: Date()) : Date()
+        enqueue { ObservationEvent.withdrawn(kind: kind, observedAt: observedAt) }
+    }
+
+    /// An enrichment and raw window can complete in one encoded millisecond.
+    /// Strict ordering also keeps a subsequent withdrawal newer than both.
+    private func nextVisitPublicationDate(proposed: Date) -> Date {
+        let milliseconds = floor(proposed.timeIntervalSince1970 * 1_000)
+        let next = max(milliseconds, (lastVisitPublicationMilliseconds ?? (milliseconds - 1)) + 1)
+        lastVisitPublicationMilliseconds = next
+        return Date(timeIntervalSince1970: next / 1_000)
     }
 
     func flush() {
