@@ -190,13 +190,14 @@ actor ObservationOutbox {
         return discardedCount
     }
 
-    func enqueue(_ event: ObservationEvent, for scope: ObservationDeliveryScope) throws {
+    @discardableResult
+    func enqueue(_ event: ObservationEvent, for scope: ObservationDeliveryScope) throws -> Bool {
         try Task.checkCancellation()
         try bind(to: scope)
         try Task.checkCancellation()
         let previous = eventsByKind[event.kind]
         if let previous, !Self.shouldReplace(previous, with: event) {
-            return
+            return false
         }
         eventsByKind[event.kind] = event
         do {
@@ -205,12 +206,26 @@ actor ObservationOutbox {
             eventsByKind[event.kind] = previous
             throw error
         }
+        return true
     }
 
     func pending(for scope: ObservationDeliveryScope) throws -> [ObservationEvent] {
         try ensureAvailable()
         try requireScope(scope)
         return eventsByKind.values.sorted { $0.kind.rawValue < $1.kind.rawValue }
+    }
+
+    /// A privacy repair must not overwrite a newer observation queued while
+    /// the caller was awaiting this actor.
+    func replacePending(
+        _ event: ObservationEvent, replacing eventID: UUID, for scope: ObservationDeliveryScope
+    ) throws -> Bool {
+        try Task.checkCancellation()
+        try ensureAvailable()
+        try requireScope(scope)
+        guard eventsByKind[event.kind]?.eventID == eventID else { return false }
+        try enqueue(event, for: scope)
+        return eventsByKind[event.kind]?.eventID == event.eventID
     }
 
     func removeSent(_ eventIDs: Set<UUID>, for scope: ObservationDeliveryScope) throws {

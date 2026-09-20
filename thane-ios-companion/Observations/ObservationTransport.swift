@@ -15,11 +15,54 @@ protocol ObservationUploading {
     /// so cancelling the Task alone would let a forgotten agent still receive
     /// the batch.
     func cancelAllTransfers() async
+
+    /// Reclaims only transfers whose visit detail is no longer permitted.
+    func cancelTransfers(disallowedBy disclosure: VisitObservationDisclosure) async
 }
 
 extension ObservationUploading {
     /// In-process uploaders have nothing to reclaim.
     func cancelAllTransfers() async {}
+
+    func cancelTransfers(disallowedBy disclosure: VisitObservationDisclosure) async {
+        guard disclosure != .enriched else { return }
+        await cancelAllTransfers()
+    }
+}
+
+/// Carries no source data. The versioned marker survives with the background
+/// task, so a later launch can revoke visits without interrupting other data.
+nonisolated enum ObservationVisitTransferContent: String, Sendable {
+    case none = "thane.observations.visits.v1.none"
+    case raw = "thane.observations.visits.v1.raw"
+    case enriched = "thane.observations.visits.v1.enriched"
+
+    init(batch: ObservationBatch) {
+        self = .none
+        for event in batch.events where event.kind == .visits && event.status == .available {
+            guard let payload = event.payload?.value as? [String: Any],
+                  let visits = payload["visits"] as? [[String: Any]],
+                  !visits.contains(where: { $0["place_context"] != nil }) else {
+                self = .enriched
+                return
+            }
+            self = .raw
+        }
+    }
+
+    static func shouldCancel(
+        taskDescription: String?, disallowedBy disclosure: VisitObservationDisclosure
+    ) -> Bool {
+        let content = taskDescription.flatMap(Self.init(rawValue:))
+        switch disclosure {
+        case .enriched:
+            return false
+        case .raw:
+            return content != Self.none && content != Self.raw
+        case .withdrawn:
+            return content != Self.none
+        }
+    }
 }
 
 nonisolated enum ObservationUploadError: LocalizedError, Sendable {
@@ -147,7 +190,9 @@ final class ObservationBackgroundSession: NSObject, URLSessionDataDelegate, @unc
     /// Uploads a body already written to `fileURL`. A background session
     /// refuses an in-memory body, which is also what lets the transfer
     /// outlive the process.
-    func upload(request: URLRequest, fromFile fileURL: URL) async throws -> (Data, URLResponse) {
+    func upload(
+        request: URLRequest, fromFile fileURL: URL, taskDescription: String
+    ) async throws -> (Data, URLResponse) {
         // withCheckedThrowingContinuation does not observe cancellation, and
         // a background transfer runs out of process, so cancelling the Task
         // alone leaves nsurlsessiond posting a batch whose credentials and
@@ -157,6 +202,7 @@ final class ObservationBackgroundSession: NSObject, URLSessionDataDelegate, @unc
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let task = session.uploadTask(with: request, fromFile: fileURL)
+                task.taskDescription = taskDescription
                 lock.lock()
                 continuations[task.taskIdentifier] = continuation
                 buffers[task.taskIdentifier] = Data()
@@ -176,6 +222,22 @@ final class ObservationBackgroundSession: NSObject, URLSessionDataDelegate, @unc
     func cancelAllTransfers() async {
         let tasks = await session.allTasks
         for task in tasks {
+            task.cancel()
+        }
+    }
+
+    func cancelTransfers(disallowedBy disclosure: VisitObservationDisclosure) async {
+        guard disclosure != .enriched else { return }
+        Self.cancelTransfers(in: await session.allTasks, disallowedBy: disclosure)
+    }
+
+    nonisolated static func cancelTransfers(
+        in tasks: [URLSessionTask], disallowedBy disclosure: VisitObservationDisclosure
+    ) {
+        for task in tasks where ObservationVisitTransferContent.shouldCancel(
+            taskDescription: task.taskDescription, disallowedBy: disclosure
+        ) {
+            // Unknown markers are conservatively reclaimed during upgrades.
             task.cancel()
         }
     }
@@ -244,6 +306,10 @@ final class URLSessionObservationUploader: ObservationUploading {
         await backgroundSession.cancelAllTransfers()
     }
 
+    func cancelTransfers(disallowedBy disclosure: VisitObservationDisclosure) async {
+        await backgroundSession.cancelTransfers(disallowedBy: disclosure)
+    }
+
     func upload(
         _ batch: ObservationBatch,
         to baseURL: URL,
@@ -257,7 +323,10 @@ final class URLSessionObservationUploader: ObservationUploading {
         request.httpBody = nil
         let fileURL = try Self.writeBody(body)
         defer { try? FileManager.default.removeItem(at: fileURL) }
-        let (data, response) = try await backgroundSession.upload(request: request, fromFile: fileURL)
+        let (data, response) = try await backgroundSession.upload(
+            request: request, fromFile: fileURL,
+            taskDescription: ObservationVisitTransferContent(batch: batch).rawValue
+        )
         return try Self.result(from: data, response: response)
     }
 

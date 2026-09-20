@@ -38,7 +38,16 @@ final class VisitWindowStore {
 
     private func restore() {
         guard let stored = try? load() else { return }
-        visits = stored.visits
+        // Older windows keyed stays by coordinates as well as arrival, so a
+        // refined departure could leave both versions on disk.
+        for visit in stored.visits {
+            if let key = visit.stayKey,
+               let index = visits.firstIndex(where: { $0.stayKey == key }) {
+                visits[index] = replacing(visits[index], with: visit)
+            } else {
+                visits.append(visit)
+            }
+        }
         lastDroppedAnchor = stored.lastDroppedAnchor
     }
 
@@ -48,16 +57,77 @@ final class VisitWindowStore {
     /// ongoing one for the same stay rather than appearing twice — Core
     /// Location delivers both.
     @discardableResult
-    func record(_ visit: VisitSnapshot, now: Date = Date()) -> VisitWindowSnapshot {
+    func record(_ visit: VisitSnapshot, now: Date = Date()) throws -> VisitWindowSnapshot {
+        var recorded = visit
         // Replace only when both sides name the same stay. Matching on a nil
         // arrival would fold every missed-arrival visit into one, discarding
         // unrelated places that happen to share a coordinate.
         if let key = visit.stayKey {
+            if let existing = visits.first(where: { $0.stayKey == key }) {
+                recorded = replacing(existing, with: visit)
+            }
             visits.removeAll { $0.stayKey == key }
         }
-        visits.append(visit)
+        visits.append(recorded)
         prune(now: now)
-        try? persist()
+        // Retain the raw observation in memory for a later retry, but never
+        // report persistence success to a caller when the write failed.
+        try persist()
+        return window(now: now)
+    }
+
+    /// Checkpoint the current raw observations before an asynchronous lookup.
+    /// This also retries a previous raw capture whose disk write failed.
+    func persistCurrentWindow(now: Date = Date()) throws -> VisitWindowSnapshot {
+        try persist()
+        return window(now: now)
+    }
+
+    private func replacing(_ existing: VisitSnapshot, with incoming: VisitSnapshot) -> VisitSnapshot {
+        if existing.state == .settled, incoming.state == .ongoing { return existing }
+        var replacement = incoming
+        replacement.visitID = existing.visitID
+        replacement.placeContext = existing.hasSameLookupLocation(as: incoming)
+            ? existing.placeContext ?? incoming.placeContext
+            : nil
+        return replacement
+    }
+
+    func visit(id: UUID, now: Date = Date()) -> VisitSnapshot? {
+        window(now: now).visits.first { $0.visitID == id }
+    }
+
+    /// Apply an asynchronous result to the current entry, never the snapshot
+    /// that started the lookup: a departure may have arrived in the meantime.
+    @discardableResult
+    func applyPlaceContext(
+        _ context: VisitPlaceContext, to id: UUID,
+        expectedVisit: VisitSnapshot? = nil, now: Date = Date()
+    ) throws -> VisitWindowSnapshot? {
+        guard let current = visit(id: id, now: now),
+              expectedVisit.map({ current.hasSameLookupLocation(as: $0) }) ?? true,
+              let index = visits.firstIndex(where: { $0.visitID == id }) else {
+            return nil
+        }
+        let previous = visits[index].placeContext
+        visits[index].placeContext = context
+        do {
+            try persist()
+        } catch {
+            visits[index].placeContext = previous
+            throw error
+        }
+        return window(now: now)
+    }
+
+    /// Revoking enrichment preserves the original visits. Keep memory clear
+    /// even if persistence fails so the caller can prevent further exposure.
+    @discardableResult
+    func removePlaceContext(now: Date = Date()) throws -> VisitWindowSnapshot {
+        for index in visits.indices {
+            visits[index].placeContext = nil
+        }
+        try persist()
         return window(now: now)
     }
 
@@ -188,7 +258,7 @@ struct VisitsPlatformHandler: PlatformServiceHandler {
     let toolDefinitions = [
         PlatformToolDefinition.make(
             name: "ios_recent_visits",
-            description: "Recent places the operator lingered, with arrival and departure times, from the active iOS companion. Covers at most the last 48 hours and 16 visits. Works only after the operator enables Visit History in the app and grants iOS Always location permission. A visit still in progress has no departure time and a partial dwell. An arrival the system did not observe is reported as unknown rather than guessed.",
+            description: "Recent places the operator lingered, with arrival and departure times, from the active iOS companion. Covers at most the last 48 hours and 16 visits. Requires Visit History and iOS Always location permission. Ongoing visits have no departure and partial dwell; unobserved arrivals are unknown. Optional place_context contains separately enabled address lookups and nearby business candidates, never proof of a business visit. Candidate distance_meters is straight-line surface distance from the reported coordinate, not walking or driving distance. Preserve provider, timestamps, search radius, partial/truncated status, and location accuracy when interpreting results.",
             method: "get_recent_visits",
             tags: ["ios", "location", "read"],
             schemaJSON: """
@@ -218,7 +288,10 @@ struct VisitsPlatformHandler: PlatformServiceHandler {
         guard preferences.locationEnabled, preferences.visitsEnabled else {
             throw VisitsHandlerError.sharingDisabled
         }
-        return try AnyCodable.fromEncodable(store.window())
+        let window = store.window()
+        let includePlaceContext = PrivateCapabilities.appleMapsVisitEnrichmentAvailable
+            && preferences.visitEnrichmentEnabled
+        return try AnyCodable.fromEncodable(includePlaceContext ? window : window.withoutPlaceContext())
     }
 }
 

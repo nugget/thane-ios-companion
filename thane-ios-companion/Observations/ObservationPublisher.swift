@@ -2,6 +2,12 @@ import Foundation
 import os
 import UIKit
 
+nonisolated enum VisitObservationDisclosure: Sendable {
+    case withdrawn
+    case raw
+    case enriched
+}
+
 @Observable
 @MainActor
 final class ObservationPublisher {
@@ -10,11 +16,15 @@ final class ObservationPublisher {
     private(set) var lastError: String?
     private(set) var isUploading = false
 
+    /// Evaluated again at delivery, including for events restored from disk.
+    @ObservationIgnored var visitDisclosure: @MainActor () -> VisitObservationDisclosure = { .raw }
+
     private let logger = Logger(
         subsystem: "info.nugget.thane-ios-companion",
         category: "observations"
     )
     private let outbox: ObservationOutbox
+    private let enqueueObservation: @Sendable (ObservationEvent, ObservationDeliveryScope) async throws -> Bool
     private let uploader: any ObservationUploading
     private var baseURL: URL?
     private var token: String?
@@ -24,19 +34,25 @@ final class ObservationPublisher {
     private var preparedScope: ObservationDeliveryScope?
     private var uploadTask: Task<Void, Never>?
     private var uploadID: UUID?
+    private var activeTransferContent: ObservationVisitTransferContent?
     private var preparationTask: Task<Void, Never>?
-    private var enqueueTasks: [UUID: Task<Void, Never>] = [:]
+    private var enqueueTasks: [UUID: Task<Result<ObservationEvent?, any Error>, Never>] = [:]
     private var flushRequestedWhileBusy = false
+    private var lastVisitPublicationMilliseconds: Double?
 
     /// The uploader is required rather than defaulted: it owns a background
     /// URLSession whose identifier must be scoped to the same profile as the
     /// outbox, and a default here could only guess at that.
     init(
         outbox: ObservationOutbox,
-        uploader: any ObservationUploading
+        uploader: any ObservationUploading,
+        enqueueObservation: (@Sendable (ObservationEvent, ObservationDeliveryScope) async throws -> Bool)? = nil
     ) {
         self.outbox = outbox
         self.uploader = uploader
+        self.enqueueObservation = enqueueObservation ?? { event, scope in
+            try await outbox.enqueue(event, for: scope)
+        }
     }
 
     func configure(
@@ -56,12 +72,14 @@ final class ObservationPublisher {
             uploadTask?.cancel()
             uploadTask = nil
             uploadID = nil
+            activeTransferContent = nil
             preparationTask?.cancel()
             preparedScope = nil
             flushRequestedWhileBusy = false
             isUploading = false
         }
         if self.deliveryScope != deliveryScope {
+            lastVisitPublicationMilliseconds = nil
             for task in enqueueTasks.values {
                 task.cancel()
             }
@@ -82,10 +100,48 @@ final class ObservationPublisher {
             isUploading = false
             return
         }
+        prepareOutbox(for: deliveryScope)
+    }
+
+    /// Stop current and inherited uploads before replacing queued private
+    /// detail. The replacement receives a new identity so Thane accepts it
+    /// even if an earlier enriched body arrived but its acknowledgement did not.
+    func reconcileVisitDisclosure() {
+        let mayContinue = activeTransferContent.map {
+            !ObservationVisitTransferContent.shouldCancel(
+                taskDescription: $0.rawValue, disallowedBy: visitDisclosure()
+            )
+        } ?? false
+        if !mayContinue {
+            uploadTask?.cancel()
+            uploadTask = nil
+            uploadID = nil
+            activeTransferContent = nil
+            flushRequestedWhileBusy = false
+            isUploading = false
+        }
+        preparationTask?.cancel()
+        preparedScope = nil
+        guard let deliveryScope else { return }
+        prepareOutbox(for: deliveryScope)
+    }
+
+    private func prepareOutbox(for deliveryScope: ObservationDeliveryScope) {
+        let previousPreparation = preparationTask
         preparationTask = Task { [weak self] in
             guard let self else { return }
             do {
+                // Serialize cleanup across rapid consent or destination changes.
+                await previousPreparation?.value
+                try Task.checkCancellation()
+                if visitDisclosure() != .enriched {
+                    await uploader.cancelTransfers(disallowedBy: visitDisclosure())
+                    try Task.checkCancellation()
+                }
                 let discardedCount = try await outbox.bind(to: deliveryScope)
+                try Task.checkCancellation()
+                guard self.deliveryScope == deliveryScope else { return }
+                _ = try await sanitizedPendingEvents(for: deliveryScope)
                 try Task.checkCancellation()
                 guard self.deliveryScope == deliveryScope else { return }
                 preparedScope = deliveryScope
@@ -137,17 +193,50 @@ final class ObservationPublisher {
     /// 2000-01-01 floor and would reject the entire batch — taking unrelated
     /// location and system-context events down with it.
     func publishVisits(_ window: VisitWindowSnapshot) {
-        guard let observedAt = ObservationCoding.date(from: window.capturedAt) else {
-            lastError = "A visit window timestamp could not be encoded."
-            return
+        do {
+            let event = try visitEvent(window)
+            enqueue { event }
+        } catch {
+            record(error)
         }
-        enqueue {
-            try ObservationEvent.available(
-                kind: .visits,
-                observedAt: observedAt,
-                payload: window
-            )
+    }
+
+    /// Acknowledges durable queueing before an external place lookup starts.
+    /// It shares the tracked writes used by synchronous publishing, so scope
+    /// changes and profile teardown cancel and drain this write as well.
+    func persistVisits(_ window: VisitWindowSnapshot) async throws {
+        try Task.checkCancellation()
+        guard let expectedScope = deliveryScope else { throw ObservationOutboxError.identityRequired }
+        let event = try visitEvent(window)
+        guard let task = enqueue({ event }) else { throw ObservationOutboxError.identityRequired }
+        try await withTaskCancellationHandler {
+            let persisted = try await task.value.get()
+            try Task.checkCancellation()
+            guard deliveryScope == expectedScope else { throw CancellationError() }
+            guard persisted?.status == .available else { throw ObservationPublicationError.visitNotPersisted }
+        } onCancel: {
+            task.cancel()
         }
+    }
+
+    private func visitEvent(_ window: VisitWindowSnapshot) throws -> ObservationEvent {
+        guard let capturedAt = ObservationCoding.date(from: window.capturedAt) else {
+            throw ObservationPublicationError.invalidVisitTimestamp
+        }
+        let observedAt = nextVisitPublicationDate(proposed: capturedAt)
+        let publishedWindow = VisitWindowSnapshot(
+            capturedAt: ObservationCoding.dateString(from: observedAt),
+            windowHours: window.windowHours,
+            maxEntries: window.maxEntries,
+            returnedCount: window.returnedCount,
+            truncated: window.truncated,
+            visits: window.visits
+        )
+        return try ObservationEvent.available(
+            kind: .visits,
+            observedAt: observedAt,
+            payload: publishedWindow
+        )
     }
 
     /// Records a system-context snapshot. Ungated at capture for the same
@@ -167,7 +256,17 @@ final class ObservationPublisher {
     }
 
     func withdraw(_ kind: ObservationKind) {
-        enqueue { ObservationEvent.withdrawn(kind: kind) }
+        let observedAt = kind == .visits ? nextVisitPublicationDate(proposed: Date()) : Date()
+        enqueue { ObservationEvent.withdrawn(kind: kind, observedAt: observedAt) }
+    }
+
+    /// An enrichment and raw window can complete in one encoded millisecond.
+    /// Strict ordering also keeps a subsequent withdrawal newer than both.
+    private func nextVisitPublicationDate(proposed: Date) -> Date {
+        let milliseconds = floor(proposed.timeIntervalSince1970 * 1_000)
+        let next = max(milliseconds, (lastVisitPublicationMilliseconds ?? (milliseconds - 1)) + 1)
+        lastVisitPublicationMilliseconds = next
+        return Date(timeIntervalSince1970: next / 1_000)
     }
 
     func flush() {
@@ -223,6 +322,7 @@ final class ObservationPublisher {
         preparedScope = nil
         uploadTask = nil
         uploadID = nil
+        activeTransferContent = nil
         preparationTask = nil
         flushRequestedWhileBusy = false
         isUploading = false
@@ -237,7 +337,7 @@ final class ObservationPublisher {
         await activeUpload?.value
         await activePreparation?.value
         for task in activeEnqueues {
-            await task.value
+            _ = await task.value
         }
         try await outbox.discardAll()
         pendingCount = 0
@@ -245,32 +345,40 @@ final class ObservationPublisher {
         lastError = nil
     }
 
-    private func enqueue(_ makeEvent: @escaping @MainActor () throws -> ObservationEvent) {
-        guard let deliveryScope else { return }
+    @discardableResult
+    private func enqueue(
+        _ makeEvent: @escaping @MainActor () throws -> ObservationEvent
+    ) -> Task<Result<ObservationEvent?, any Error>, Never>? {
+        guard let deliveryScope else { return nil }
         let taskID = UUID()
-        let task = Task { [weak self] in
-            guard let self else { return }
+        let task = Task<Result<ObservationEvent?, any Error>, Never> { [weak self] in
+            guard let self else { return .failure(CancellationError()) }
             defer { enqueueTasks[taskID] = nil }
             do {
                 try Task.checkCancellation()
-                let event = try makeEvent()
+                let original = try makeEvent()
+                let event = sanitizedVisitEvent(original) ?? original
                 try Task.checkCancellation()
-                try await outbox.enqueue(event, for: deliveryScope)
+                let persisted = try await enqueueObservation(event, deliveryScope)
                 try Task.checkCancellation()
-                guard self.deliveryScope == deliveryScope else { return }
-                preparedScope = deliveryScope
+                guard self.deliveryScope == deliveryScope else { throw CancellationError() }
                 lastError = nil
                 await refreshPendingCount(for: deliveryScope)
+                try Task.checkCancellation()
+                guard self.deliveryScope == deliveryScope else { throw CancellationError() }
                 flush()
+                return .success(persisted ? event : nil)
             } catch is CancellationError {
-                return
+                return .failure(CancellationError())
             } catch {
-                if self.deliveryScope == deliveryScope {
+                if !Task.isCancelled, self.deliveryScope == deliveryScope {
                     record(error)
                 }
+                return .failure(error)
             }
         }
         enqueueTasks[taskID] = task
+        return task
     }
 
     private func performUpload(
@@ -297,7 +405,8 @@ final class ObservationPublisher {
         var completedBatch = false
 
         do {
-            let events = try await outbox.pending(for: deliveryScope)
+            let events = try await sanitizedPendingEvents(for: deliveryScope)
+            try Task.checkCancellation()
             if !events.isEmpty {
                 guard authorizationExpiresAt > Date(),
                       self.authorizationExpiresAt == authorizationExpiresAt else {
@@ -314,6 +423,8 @@ final class ObservationPublisher {
                     osVersion: UIDevice.current.systemVersion,
                     events: Array(events.prefix(16))
                 )
+                try Task.checkCancellation()
+                activeTransferContent = ObservationVisitTransferContent(batch: batch)
                 _ = try await uploader.upload(batch, to: baseURL, token: token)
                 try Task.checkCancellation()
                 try await outbox.removeSent(Set(batch.events.map(\.eventID)), for: deliveryScope)
@@ -337,10 +448,12 @@ final class ObservationPublisher {
         if self.deliveryScope == deliveryScope {
             await refreshPendingCount(for: deliveryScope)
         }
+        guard self.uploadID == uploadID else { return }
         let shouldFlushAgain = flushRequestedWhileBusy || completedBatch
         flushRequestedWhileBusy = false
         uploadTask = nil
         self.uploadID = nil
+        activeTransferContent = nil
         isUploading = false
         if shouldFlushAgain,
            pendingCount > 0,
@@ -366,6 +479,48 @@ final class ObservationPublisher {
         }
     }
 
+    private func sanitizedPendingEvents(for scope: ObservationDeliveryScope) async throws -> [ObservationEvent] {
+        while true {
+            let events = try await outbox.pending(for: scope)
+            try Task.checkCancellation()
+            guard let visit = events.first(where: { $0.kind == .visits }),
+                  let replacement = sanitizedVisitEvent(visit) else { return events }
+            _ = try await outbox.replacePending(replacement, replacing: visit.eventID, for: scope)
+            try Task.checkCancellation()
+        }
+    }
+
+    /// Returns nil when the event already satisfies the current disclosure.
+    private func sanitizedVisitEvent(_ event: ObservationEvent) -> ObservationEvent? {
+        guard event.kind == .visits, event.status == .available else { return nil }
+        let disclosure = visitDisclosure()
+        guard disclosure != .enriched else { return nil }
+
+        var payload = event.payload?.value as? [String: Any]
+        var changed = false
+        if disclosure == .raw,
+           var visits = payload?["visits"] as? [[String: Any]] {
+            for index in visits.indices {
+                if visits[index].removeValue(forKey: "place_context") != nil { changed = true }
+            }
+            guard changed else { return nil }
+            payload?["visits"] = visits
+        } else {
+            // A malformed persisted payload cannot be safely partially disclosed.
+            payload = nil
+        }
+
+        let originalMilliseconds = ceil(event.observedAt.timeIntervalSince1970 * 1_000)
+        let proposed = max(Date(), Date(timeIntervalSince1970: (originalMilliseconds + 1) / 1_000))
+        let observedAt = nextVisitPublicationDate(proposed: proposed)
+        guard var payload else { return .withdrawn(kind: .visits, observedAt: observedAt) }
+        payload["captured_at"] = ObservationCoding.dateString(from: observedAt)
+        return ObservationEvent(
+            eventID: UUID(), kind: .visits, schemaVersion: event.schemaVersion,
+            status: .available, observedAt: observedAt, payload: AnyCodable(payload)
+        )
+    }
+
     private func authorizePrivatePublish() -> Bool {
         guard let authorizationExpiresAt else { return false }
         guard authorizationExpiresAt > Date() else {
@@ -383,6 +538,7 @@ final class ObservationPublisher {
         uploadTask?.cancel()
         uploadTask = nil
         uploadID = nil
+        activeTransferContent = nil
         flushRequestedWhileBusy = false
         isUploading = false
         baseURL = nil
@@ -404,6 +560,20 @@ final class ObservationPublisher {
         case let (version?, nil): version
         case let (nil, build?): build
         case (nil, nil): "unknown"
+        }
+    }
+}
+
+private nonisolated enum ObservationPublicationError: LocalizedError {
+    case invalidVisitTimestamp
+    case visitNotPersisted
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidVisitTimestamp:
+            "A visit window timestamp could not be encoded."
+        case .visitNotPersisted:
+            "The visit window was not queued for sharing."
         }
     }
 }

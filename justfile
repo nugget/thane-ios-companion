@@ -8,6 +8,9 @@ default:
     @echo "Common workflows:"
     @echo "    just build    # build for a generic iOS device"
     @echo "    just build-release # build the App Store configuration"
+    @echo "    just build-device # build signed Debug app for a physical device"
+    @echo "    just devices  # list paired physical iPhones"
+    @echo "    just deploy <device> # build, install, and launch on an explicit iPhone"
     @echo "    just test     # run Swift Testing on an iPhone simulator"
     @echo "    just ci       # full local gate"
 
@@ -36,6 +39,19 @@ build-release:
         CODE_SIGNING_ALLOWED=NO \
         build
 
+[doc("Build a signed Debug app using local development signing assets")]
+build-device:
+    bash scripts/deploy-ios.sh build
+
+[doc("List physical iPhones without exposing hardware identifiers")]
+devices:
+    bash scripts/deploy-ios.sh devices
+
+[doc("Build signed Debug, install in place, and launch on an explicit iPhone name or identifier")]
+[positional-arguments]
+deploy device:
+    bash scripts/deploy-ios.sh deploy "$1"
+
 [doc("Run unit tests on the latest configured iPhone simulator")]
 test:
     #!/usr/bin/env bash
@@ -54,6 +70,7 @@ lint:
     plutil -lint thane-ios-companion/Info.plist
     plutil -lint thane-ios-companion/PrivacyInfo.xcprivacy
     plutil -lint thane-ios-companion.xcodeproj/project.pbxproj
+    bash -n scripts/deploy-ios.sh
     git diff --check
 
 [doc("Run the full local validation gate")]
