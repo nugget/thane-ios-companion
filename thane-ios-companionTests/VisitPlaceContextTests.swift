@@ -42,9 +42,9 @@ struct VisitPlaceContextTests {
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let arrival = now.addingTimeInterval(-600)
         let ongoing = try makeVisit(arrivedAt: arrival, ongoing: true, capturedAt: now)
-        store.record(ongoing, now: now)
+        try store.record(ongoing, now: now)
         let settled = try makeVisit(arrivedAt: arrival, capturedAt: now.addingTimeInterval(120))
-        store.record(settled, now: now.addingTimeInterval(120))
+        try store.record(settled, now: now.addingTimeInterval(120))
 
         let updated = try #require(store.applyPlaceContext(
             resolvedContext(), to: ongoing.visitID, now: now.addingTimeInterval(121)
@@ -66,11 +66,11 @@ struct VisitPlaceContextTests {
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let arrival = now.addingTimeInterval(-600)
         let ongoing = try makeVisit(arrivedAt: arrival, ongoing: true, capturedAt: now)
-        store.record(ongoing, now: now)
+        try store.record(ongoing, now: now)
         try store.applyPlaceContext(resolvedContext(), to: ongoing.visitID, now: now)
         let settled = try makeVisit(arrivedAt: arrival, capturedAt: now.addingTimeInterval(120))
-        store.record(settled, now: now.addingTimeInterval(120))
-        store.record(ongoing, now: now.addingTimeInterval(121))
+        try store.record(settled, now: now.addingTimeInterval(120))
+        try store.record(ongoing, now: now.addingTimeInterval(121))
 
         let updated = try #require(store.visit(id: ongoing.visitID, now: now))
         #expect(updated.state == .settled)
@@ -87,14 +87,14 @@ struct VisitPlaceContextTests {
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let arrival = now.addingTimeInterval(-600)
         let ongoing = try makeVisit(arrivedAt: arrival, ongoing: true, capturedAt: now)
-        store.record(ongoing, now: now)
+        try store.record(ongoing, now: now)
         try store.applyPlaceContext(resolvedContext(), to: ongoing.visitID, now: now)
         let refined = try makeVisit(
             arrivedAt: arrival, capturedAt: now.addingTimeInterval(120),
             latitude: changeCoordinates ? ongoing.latitude + 0.0001 : ongoing.latitude,
             accuracy: changeCoordinates ? ongoing.horizontalAccuracyMeters : 3
         )
-        let window = store.record(refined, now: now.addingTimeInterval(120))
+        let window = try store.record(refined, now: now.addingTimeInterval(120))
         let current = try #require(window.visits.first)
         #expect(window.visits.count == 1)
         #expect(current.visitID == ongoing.visitID)
@@ -152,8 +152,8 @@ struct VisitPlaceContextTests {
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let first = try makeVisit(arrivedAt: .distantPast, capturedAt: now.addingTimeInterval(-600))
         let second = try makeVisit(arrivedAt: .distantPast, capturedAt: now)
-        store.record(first, now: now)
-        store.record(second, now: now)
+        try store.record(first, now: now)
+        try store.record(second, now: now)
         try store.applyPlaceContext(resolvedContext(), to: first.visitID, now: now)
 
         #expect(first.visitID != second.visitID)
@@ -168,13 +168,13 @@ struct VisitPlaceContextTests {
         defer { fixture.cleanup() }
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let visit = try makeVisit(capturedAt: now)
-        store.record(visit, now: now)
+        try store.record(visit, now: now)
         let expired = now.addingTimeInterval(VisitWindowSnapshot.windowHours * 3600 + 1)
         #expect(try store.applyPlaceContext(resolvedContext(), to: visit.visitID, now: expired) == nil)
         #expect(try store.applyPlaceContext(resolvedContext(), to: UUID(), now: now) == nil)
 
         for index in 1...VisitWindowSnapshot.maxEntries {
-            store.record(try makeVisit(
+            try store.record(try makeVisit(
                 arrivedAt: .distantPast, capturedAt: now.addingTimeInterval(Double(index))
             ), now: now)
         }
@@ -191,7 +191,7 @@ struct VisitPlaceContextTests {
         defer { fixture.cleanup() }
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let original = try makeVisit(capturedAt: now)
-        store.record(original, now: now)
+        try store.record(original, now: now)
         try store.applyPlaceContext(resolvedContext(), to: original.visitID, now: now.addingTimeInterval(3_600))
         let stripped = try store.removePlaceContext(now: now.addingTimeInterval(7_200))
         #expect(stripped.visits == [original])
@@ -206,7 +206,7 @@ struct VisitPlaceContextTests {
         defer { fixture.cleanup() }
         let store = VisitWindowStore(fileURL: fixture.fileURL)
         let original = try makeVisit(capturedAt: now)
-        store.record(original, now: now)
+        try store.record(original, now: now)
         try store.applyPlaceContext(resolvedContext(), to: original.visitID, now: now)
         try FileManager.default.removeItem(at: fixture.fileURL)
         try FileManager.default.createDirectory(at: fixture.fileURL, withIntermediateDirectories: true)

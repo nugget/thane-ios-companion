@@ -190,13 +190,14 @@ actor ObservationOutbox {
         return discardedCount
     }
 
-    func enqueue(_ event: ObservationEvent, for scope: ObservationDeliveryScope) throws {
+    @discardableResult
+    func enqueue(_ event: ObservationEvent, for scope: ObservationDeliveryScope) throws -> Bool {
         try Task.checkCancellation()
         try bind(to: scope)
         try Task.checkCancellation()
         let previous = eventsByKind[event.kind]
         if let previous, !Self.shouldReplace(previous, with: event) {
-            return
+            return false
         }
         eventsByKind[event.kind] = event
         do {
@@ -205,6 +206,7 @@ actor ObservationOutbox {
             eventsByKind[event.kind] = previous
             throw error
         }
+        return true
     }
 
     func pending(for scope: ObservationDeliveryScope) throws -> [ObservationEvent] {

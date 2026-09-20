@@ -24,6 +24,7 @@ final class ObservationPublisher {
         category: "observations"
     )
     private let outbox: ObservationOutbox
+    private let enqueueObservation: @Sendable (ObservationEvent, ObservationDeliveryScope) async throws -> Bool
     private let uploader: any ObservationUploading
     private var baseURL: URL?
     private var token: String?
@@ -35,7 +36,7 @@ final class ObservationPublisher {
     private var uploadID: UUID?
     private var activeTransferContent: ObservationVisitTransferContent?
     private var preparationTask: Task<Void, Never>?
-    private var enqueueTasks: [UUID: Task<Void, Never>] = [:]
+    private var enqueueTasks: [UUID: Task<Result<ObservationEvent?, any Error>, Never>] = [:]
     private var flushRequestedWhileBusy = false
     private var lastVisitPublicationMilliseconds: Double?
 
@@ -44,10 +45,14 @@ final class ObservationPublisher {
     /// outbox, and a default here could only guess at that.
     init(
         outbox: ObservationOutbox,
-        uploader: any ObservationUploading
+        uploader: any ObservationUploading,
+        enqueueObservation: (@Sendable (ObservationEvent, ObservationDeliveryScope) async throws -> Bool)? = nil
     ) {
         self.outbox = outbox
         self.uploader = uploader
+        self.enqueueObservation = enqueueObservation ?? { event, scope in
+            try await outbox.enqueue(event, for: scope)
+        }
     }
 
     func configure(
@@ -188,9 +193,35 @@ final class ObservationPublisher {
     /// 2000-01-01 floor and would reject the entire batch — taking unrelated
     /// location and system-context events down with it.
     func publishVisits(_ window: VisitWindowSnapshot) {
+        do {
+            let event = try visitEvent(window)
+            enqueue { event }
+        } catch {
+            record(error)
+        }
+    }
+
+    /// Acknowledges durable queueing before an external place lookup starts.
+    /// It shares the tracked writes used by synchronous publishing, so scope
+    /// changes and profile teardown cancel and drain this write as well.
+    func persistVisits(_ window: VisitWindowSnapshot) async throws {
+        try Task.checkCancellation()
+        guard let expectedScope = deliveryScope else { throw ObservationOutboxError.identityRequired }
+        let event = try visitEvent(window)
+        guard let task = enqueue({ event }) else { throw ObservationOutboxError.identityRequired }
+        try await withTaskCancellationHandler {
+            let persisted = try await task.value.get()
+            try Task.checkCancellation()
+            guard deliveryScope == expectedScope else { throw CancellationError() }
+            guard persisted?.status == .available else { throw ObservationPublicationError.visitNotPersisted }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func visitEvent(_ window: VisitWindowSnapshot) throws -> ObservationEvent {
         guard let capturedAt = ObservationCoding.date(from: window.capturedAt) else {
-            lastError = "A visit window timestamp could not be encoded."
-            return
+            throw ObservationPublicationError.invalidVisitTimestamp
         }
         let observedAt = nextVisitPublicationDate(proposed: capturedAt)
         let publishedWindow = VisitWindowSnapshot(
@@ -201,13 +232,11 @@ final class ObservationPublisher {
             truncated: window.truncated,
             visits: window.visits
         )
-        enqueue {
-            try ObservationEvent.available(
-                kind: .visits,
-                observedAt: observedAt,
-                payload: publishedWindow
-            )
-        }
+        return try ObservationEvent.available(
+            kind: .visits,
+            observedAt: observedAt,
+            payload: publishedWindow
+        )
     }
 
     /// Records a system-context snapshot. Ungated at capture for the same
@@ -308,7 +337,7 @@ final class ObservationPublisher {
         await activeUpload?.value
         await activePreparation?.value
         for task in activeEnqueues {
-            await task.value
+            _ = await task.value
         }
         try await outbox.discardAll()
         pendingCount = 0
@@ -316,32 +345,40 @@ final class ObservationPublisher {
         lastError = nil
     }
 
-    private func enqueue(_ makeEvent: @escaping @MainActor () throws -> ObservationEvent) {
-        guard let deliveryScope else { return }
+    @discardableResult
+    private func enqueue(
+        _ makeEvent: @escaping @MainActor () throws -> ObservationEvent
+    ) -> Task<Result<ObservationEvent?, any Error>, Never>? {
+        guard let deliveryScope else { return nil }
         let taskID = UUID()
-        let task = Task { [weak self] in
-            guard let self else { return }
+        let task = Task<Result<ObservationEvent?, any Error>, Never> { [weak self] in
+            guard let self else { return .failure(CancellationError()) }
             defer { enqueueTasks[taskID] = nil }
             do {
                 try Task.checkCancellation()
                 let original = try makeEvent()
                 let event = sanitizedVisitEvent(original) ?? original
                 try Task.checkCancellation()
-                try await outbox.enqueue(event, for: deliveryScope)
+                let persisted = try await enqueueObservation(event, deliveryScope)
                 try Task.checkCancellation()
-                guard self.deliveryScope == deliveryScope else { return }
+                guard self.deliveryScope == deliveryScope else { throw CancellationError() }
                 lastError = nil
                 await refreshPendingCount(for: deliveryScope)
+                try Task.checkCancellation()
+                guard self.deliveryScope == deliveryScope else { throw CancellationError() }
                 flush()
+                return .success(persisted ? event : nil)
             } catch is CancellationError {
-                return
+                return .failure(CancellationError())
             } catch {
-                if self.deliveryScope == deliveryScope {
+                if !Task.isCancelled, self.deliveryScope == deliveryScope {
                     record(error)
                 }
+                return .failure(error)
             }
         }
         enqueueTasks[taskID] = task
+        return task
     }
 
     private func performUpload(
@@ -523,6 +560,20 @@ final class ObservationPublisher {
         case let (version?, nil): version
         case let (nil, build?): build
         case (nil, nil): "unknown"
+        }
+    }
+}
+
+private nonisolated enum ObservationPublicationError: LocalizedError {
+    case invalidVisitTimestamp
+    case visitNotPersisted
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidVisitTimestamp:
+            "A visit window timestamp could not be encoded."
+        case .visitNotPersisted:
+            "The visit window was not queued for sharing."
         }
     }
 }

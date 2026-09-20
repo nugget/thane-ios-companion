@@ -34,6 +34,30 @@ struct VisitEnrichmentIntegrationTests {
         #expect(fixture.uploader.calls == 0)
     }
 
+    @Test("A failed raw outbox write blocks lookup until a successful retry")
+    func persistenceFailureBlocksLookup() async throws {
+        let writer = RecoverableVisitWriter()
+        let fixture = try await VisitIntegrationFixture(writer: writer)
+        defer { fixture.cleanup() }
+        let visit = try fixture.makeVisit()
+        fixture.profile.locationService.onVisit?(visit)
+
+        try await waitUntil { fixture.profile.visitEnrichment.lastError != nil }
+        #expect(fixture.resolver.calls == 0)
+        #expect(VisitWindowStore(fileURL: fixture.windowURL).visit(id: visit.visitID) != nil)
+        #expect(try await fixture.pendingWindow() == nil)
+
+        await writer.recover()
+        fixture.profile.visitEnrichment.resume()
+        try await waitUntil { fixture.resolver.hasPendingRequest }
+        #expect(try await fixture.pendingWindow()?.visits.first?.visitID == visit.visitID)
+        #expect(fixture.resolver.calls == 1)
+        fixture.resolver.complete()
+        try await waitUntil {
+            try await fixture.pendingWindow()?.visits.first?.placeContext?.status == .resolved
+        }
+    }
+
     @Test("A departure during a lookup keeps one enriched settled visit")
     func departureMergesWithPendingLookup() async throws {
         let fixture = try await VisitIntegrationFixture()
@@ -215,7 +239,7 @@ private final class VisitIntegrationFixture {
     private let defaults: UserDefaults
     private let directory: URL
 
-    init() async throws {
+    init(writer: RecoverableVisitWriter? = nil) async throws {
         suite = "VisitEnrichmentIntegrationTests.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: suite))
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
@@ -233,7 +257,13 @@ private final class VisitIntegrationFixture {
         let outbox = ObservationOutbox(fileURL: directory.appendingPathComponent("outbox.json"))
         self.outbox = outbox
         try await outbox.bind(to: scope)
-        let publisher = ObservationPublisher(outbox: outbox, uploader: uploader)
+        let enqueue: (@Sendable (ObservationEvent, ObservationDeliveryScope) async throws -> Bool)?
+        if let writer {
+            enqueue = { event, scope in try await writer.enqueue(event, for: scope, outbox: outbox) }
+        } else {
+            enqueue = nil
+        }
+        let publisher = ObservationPublisher(outbox: outbox, uploader: uploader, enqueueObservation: enqueue)
         profile = AgentProfile(
             connectionSettings: settings,
             sharingPreferences: SharingPreferences(defaults: defaults),
@@ -277,6 +307,19 @@ private final class VisitIntegrationFixture {
         profile.disconnect()
         defaults.removePersistentDomain(forName: suite)
         try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private actor RecoverableVisitWriter {
+    private var shouldFail = true
+
+    func recover() { shouldFail = false }
+
+    func enqueue(
+        _ event: ObservationEvent, for scope: ObservationDeliveryScope, outbox: ObservationOutbox
+    ) async throws -> Bool {
+        guard !shouldFail else { throw CocoaError(.fileWriteNoPermission) }
+        return try await outbox.enqueue(event, for: scope)
     }
 }
 

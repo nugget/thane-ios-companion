@@ -72,7 +72,7 @@ struct VisitMonitoringTests {
     func windowTimestampIsSane() throws {
         let store = VisitWindowStore(fileURL: Self.tempFile())
         defer { store.discardAll() }
-        let window = store.record(try #require(VisitSnapshot.make(
+        let window = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch,
             horizontalAccuracy: 9,
             arrivalDate: .distantPast,
@@ -97,7 +97,7 @@ struct VisitMonitoringTests {
         let base = Date()
 
         for i in 0..<(VisitWindowSnapshot.maxEntries + 4) {
-            _ = store.record(try #require(VisitSnapshot.make(
+            _ = try store.record(try #require(VisitSnapshot.make(
                 coordinate: CLLocationCoordinate2D(latitude: 29.8 + Double(i) / 1000, longitude: -98.4),
                 horizontalAccuracy: 10,
                 arrivalDate: base.addingTimeInterval(Double(i) * 60 - 3600),
@@ -119,11 +119,11 @@ struct VisitMonitoringTests {
         defer { store.discardAll() }
         let arrived = Date().addingTimeInterval(-1800)
 
-        _ = store.record(try #require(VisitSnapshot.make(
+        _ = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch, horizontalAccuracy: 10,
             arrivalDate: arrived, departureDate: .distantFuture, capturedAt: Date()
         )))
-        let window = store.record(try #require(VisitSnapshot.make(
+        let window = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch, horizontalAccuracy: 10,
             arrivalDate: arrived, departureDate: Date(), capturedAt: Date()
         )))
@@ -136,7 +136,7 @@ struct VisitMonitoringTests {
     func windowPersists() throws {
         let url = Self.tempFile()
         let first = VisitWindowStore(fileURL: url)
-        _ = first.record(try #require(VisitSnapshot.make(
+        _ = try first.record(try #require(VisitSnapshot.make(
             coordinate: ranch, horizontalAccuracy: 10,
             arrivalDate: Date().addingTimeInterval(-600), departureDate: Date(), capturedAt: Date()
         )))
@@ -150,7 +150,7 @@ struct VisitMonitoringTests {
     func discardClearsTheWindow() throws {
         let url = Self.tempFile()
         let store = VisitWindowStore(fileURL: url)
-        _ = store.record(try #require(VisitSnapshot.make(
+        _ = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch, horizontalAccuracy: 10,
             arrivalDate: Date().addingTimeInterval(-600), departureDate: Date(), capturedAt: Date()
         )))
@@ -169,7 +169,7 @@ struct VisitMonitoringTests {
         let store = VisitWindowStore(fileURL: Self.tempFile())
         defer { store.discardAll() }
         let now = Date()
-        let window = store.record(try #require(VisitSnapshot.make(
+        let window = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch,
             horizontalAccuracy: 10,
             arrivalDate: now.addingTimeInterval(-72 * 3600),
@@ -190,7 +190,7 @@ struct VisitMonitoringTests {
         let now = Date()
 
         for offset in [-3600.0, -1800.0] {
-            _ = store.record(try #require(VisitSnapshot.make(
+            _ = try store.record(try #require(VisitSnapshot.make(
                 coordinate: ranch,
                 horizontalAccuracy: 10,
                 arrivalDate: .distantPast,
@@ -209,7 +209,7 @@ struct VisitMonitoringTests {
         let url = Self.tempFile()
         let store = VisitWindowStore(fileURL: url)
         let recorded = Date()
-        _ = store.record(try #require(VisitSnapshot.make(
+        _ = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch, horizontalAccuracy: 10,
             arrivalDate: recorded.addingTimeInterval(-600),
             departureDate: recorded, capturedAt: recorded
@@ -231,7 +231,7 @@ struct VisitMonitoringTests {
         let now = Date()
 
         for i in 0...VisitWindowSnapshot.maxEntries {
-            _ = store.record(try #require(VisitSnapshot.make(
+            _ = try store.record(try #require(VisitSnapshot.make(
                 coordinate: CLLocationCoordinate2D(latitude: 29.8 + Double(i) / 1000, longitude: -98.4),
                 horizontalAccuracy: 10,
                 arrivalDate: now.addingTimeInterval(Double(i) * 60 - 3600),
@@ -249,7 +249,7 @@ struct VisitMonitoringTests {
     func discardRemovesTheFile() throws {
         let url = Self.tempFile()
         let store = VisitWindowStore(fileURL: url)
-        _ = store.record(try #require(VisitSnapshot.make(
+        _ = try store.record(try #require(VisitSnapshot.make(
             coordinate: ranch, horizontalAccuracy: 10,
             arrivalDate: Date().addingTimeInterval(-600), departureDate: Date(), capturedAt: Date()
         )))
@@ -355,7 +355,7 @@ struct VisitMonitoringTests {
         let now = Date()
         let store = VisitWindowStore(fileURL: url)
         for i in 0...VisitWindowSnapshot.maxEntries {
-            _ = store.record(try #require(VisitSnapshot.make(
+            _ = try store.record(try #require(VisitSnapshot.make(
                 coordinate: CLLocationCoordinate2D(latitude: 29.8 + Double(i) / 1000, longitude: -98.4),
                 horizontalAccuracy: 10,
                 arrivalDate: now.addingTimeInterval(Double(i) * 60 - 3600),

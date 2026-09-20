@@ -15,6 +15,7 @@ final class VisitEnrichmentCoordinator {
 
     private let store: VisitWindowStore
     private let currentScope: @MainActor () -> String?
+    private let prepareLookup: @MainActor (VisitWindowSnapshot) async throws -> Void
     private let publish: @MainActor (VisitWindowSnapshot) -> Void
     private let now: @MainActor () -> Date
     private let timeout: Duration
@@ -26,12 +27,14 @@ final class VisitEnrichmentCoordinator {
     init(
         store: VisitWindowStore,
         currentScope: @escaping @MainActor () -> String?,
+        prepareLookup: @escaping @MainActor (VisitWindowSnapshot) async throws -> Void,
         publish: @escaping @MainActor (VisitWindowSnapshot) -> Void,
         now: @escaping @MainActor () -> Date = Date.init,
         timeout: Duration = .seconds(20)
     ) {
         self.store = store
         self.currentScope = currentScope
+        self.prepareLookup = prepareLookup
         self.publish = publish
         self.now = now
         self.timeout = timeout
@@ -77,8 +80,21 @@ final class VisitEnrichmentCoordinator {
             guard let visit = store.window(now: now()).visits.first(where: {
                 !attempted.contains($0.visitID) && needsLookup($0, provider: resolver.provider, at: now())
             }) else { return }
-            attempted.insert(visit.visitID)
             isResolving = true
+            do {
+                let window = try store.persistCurrentWindow(now: now())
+                try await prepareLookup(window)
+            } catch {
+                guard permitsCompletion(scope: scope, generation: generation) else { return }
+                lastError = "The original visit could not be saved and queued. Place lookup will wait."
+                return
+            }
+            guard permitsCompletion(scope: scope, generation: generation) else { return }
+            // A departure, refinement, or another visit can arrive while the
+            // outbox write waits. Requeue changed raw facts before looking up.
+            guard let current = store.visit(id: visit.visitID, now: now()),
+                  Self.sameRawObservation(current, visit) else { continue }
+            attempted.insert(visit.visitID)
             let attemptedAt = ObservationCoding.dateString(from: now())
             do {
                 guard try store.applyPlaceContext(
@@ -138,6 +154,14 @@ final class VisitEnrichmentCoordinator {
                 return
             }
         }
+    }
+
+    private static func sameRawObservation(_ lhs: VisitSnapshot, _ rhs: VisitSnapshot) -> Bool {
+        var left = lhs
+        var right = rhs
+        left.placeContext = nil
+        right.placeContext = nil
+        return left == right
     }
 
     private func permitsCompletion(scope: String, generation: UUID) -> Bool {

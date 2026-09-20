@@ -57,7 +57,7 @@ final class VisitWindowStore {
     /// ongoing one for the same stay rather than appearing twice — Core
     /// Location delivers both.
     @discardableResult
-    func record(_ visit: VisitSnapshot, now: Date = Date()) -> VisitWindowSnapshot {
+    func record(_ visit: VisitSnapshot, now: Date = Date()) throws -> VisitWindowSnapshot {
         var recorded = visit
         // Replace only when both sides name the same stay. Matching on a nil
         // arrival would fold every missed-arrival visit into one, discarding
@@ -70,7 +70,16 @@ final class VisitWindowStore {
         }
         visits.append(recorded)
         prune(now: now)
-        try? persist()
+        // Retain the raw observation in memory for a later retry, but never
+        // report persistence success to a caller when the write failed.
+        try persist()
+        return window(now: now)
+    }
+
+    /// Checkpoint the current raw observations before an asynchronous lookup.
+    /// This also retries a previous raw capture whose disk write failed.
+    func persistCurrentWindow(now: Date = Date()) throws -> VisitWindowSnapshot {
+        try persist()
         return window(now: now)
     }
 

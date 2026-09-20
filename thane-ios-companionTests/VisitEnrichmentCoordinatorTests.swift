@@ -174,6 +174,7 @@ private final class EnrichmentFixture {
         coordinator = VisitEnrichmentCoordinator(
             store: store,
             currentScope: { [weak self] in self?.scope },
+            prepareLookup: { _ in },
             publish: { [weak self] in self?.publications.append($0) },
             now: { [weak self] in self?.date ?? Date() },
             timeout: timeout

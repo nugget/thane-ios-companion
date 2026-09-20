@@ -23,6 +23,10 @@ final class AgentProfile: Identifiable {
     @ObservationIgnored lazy var visitEnrichment = VisitEnrichmentCoordinator(
         store: visitWindow,
         currentScope: { [weak self] in self?.visitEnrichmentScope },
+        prepareLookup: { [weak self] window in
+            guard let self, self.visitEnrichmentScope != nil else { throw CancellationError() }
+            try await self.observationPublisher.persistVisits(window)
+        },
         publish: { [weak self] window in self?.publishVisits(window) }
     )
 
@@ -120,7 +124,8 @@ final class AgentProfile: Identifiable {
         observationPublisher.visitDisclosure = { [weak self] in
             guard let self,
                   self.sharingPreferences.locationEnabled,
-                  self.sharingPreferences.visitsEnabled else { return .withdrawn }
+                  self.sharingPreferences.visitsEnabled,
+                  self.locationService.authorizationStatus == .authorizedAlways else { return .withdrawn }
             return PrivateCapabilities.appleMapsVisitEnrichmentAvailable && self.sharingPreferences.visitEnrichmentEnabled
                 ? .enriched : .raw
         }
@@ -134,8 +139,15 @@ final class AgentProfile: Identifiable {
         }
         locationService.onVisit = { [weak self] visit in
             guard let self else { return }
-            publishVisits(visitWindow.record(visit))
-            resumeVisitEnrichment()
+            do {
+                publishVisits(try visitWindow.record(visit))
+                resumeVisitEnrichment()
+            } catch {
+                configurationError = "The visit history could not be saved on this iPhone. Place details will wait."
+                // Raw capture can still reach the durable outbox while local
+                // history storage recovers. Enrichment requires both writes.
+                publishVisits(visitWindow.window())
+            }
             refreshIdentityOpportunistically()
         }
         locationService.onVisitMonitoringUnavailable = { [weak self, weak observationPublisher] in
@@ -145,7 +157,6 @@ final class AgentProfile: Identifiable {
             self?.visitWindow.discardAll()
             observationPublisher?.withdraw(.visits)
         }
-        locationService.restoreBackgroundMonitoringIfAuthorized()
         systemService.setChangeHandler { [weak self] in
             self?.publishSystemContextIfEnabled()
         }
@@ -222,6 +233,9 @@ final class AgentProfile: Identifiable {
             configurationError = error.localizedDescription
         }
         configureObservationPublisher()
+        // Authorization reconciliation can emit withdrawals even when the
+        // previous observation was already acknowledged. Bind its recipient first.
+        locationService.restoreBackgroundMonitoringIfAuthorized()
         if !sharingPreferences.visitEnrichmentEnabled {
             removeVisitPlaceContext()
         }
@@ -604,7 +618,8 @@ final class AgentProfile: Identifiable {
     }
 
     private func publishVisits(_ window: VisitWindowSnapshot) {
-        guard sharingPreferences.locationEnabled, sharingPreferences.visitsEnabled else { return }
+        guard sharingPreferences.locationEnabled, sharingPreferences.visitsEnabled,
+              locationService.authorizationStatus == .authorizedAlways else { return }
         let includePlaceContext = PrivateCapabilities.appleMapsVisitEnrichmentAvailable
             && sharingPreferences.visitEnrichmentEnabled
         observationPublisher.publishVisits(includePlaceContext ? window : window.withoutPlaceContext())
