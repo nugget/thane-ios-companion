@@ -40,6 +40,20 @@ struct SettingsView: View {
                 Text("Each agent owns its identity, sharing policy, and connection settings. Adding or removing a connection stays within that agent's settings.")
             }
 
+            if PrivateCapabilities.visualContextAvailable {
+                Section {
+                    NavigationLink {
+                        VisualContextView()
+                    } label: {
+                        Label("Image Context Preview", systemImage: "photo.badge.magnifyingglass")
+                    }
+                } header: {
+                    Text("On This iPhone")
+                } footer: {
+                    Text("Try an on-device interpretation of an image you choose. Available in development builds.")
+                }
+            }
+
             Section("About") {
                 LabeledContent("App version", value: appVersion)
             }

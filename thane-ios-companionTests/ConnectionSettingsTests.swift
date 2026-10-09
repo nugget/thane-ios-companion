@@ -394,7 +394,7 @@ private final class FakeCredentialStore: CredentialStoring {
 
 /// Records the order of key writes so ordering invariants that only matter in a
 /// crash window can be asserted without actually interrupting the process.
-private final class OrderRecordingDefaults: UserDefaults, @unchecked Sendable {
+private final class OrderRecordingDefaults: UserDefaults {
     private(set) var recordedWrites: [String] = []
 
     override func set(_ value: Any?, forKey defaultName: String) {
