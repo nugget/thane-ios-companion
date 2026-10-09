@@ -40,4 +40,28 @@ struct AppPreferencesTests {
 
         #expect(preferences.appearance == .automatic)
     }
+
+    @Test("Image context defaults off independently of photo sharing")
+    func visualContextDefaultOff() throws {
+        let suite = "AppPreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: "sharing.photos")
+
+        #expect(!AppPreferences(defaults: defaults).visualContextEnabled)
+    }
+
+    @Test("Image context opt-in persists and can be revoked")
+    func visualContextPersistence() throws {
+        let suite = "AppPreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.visualContextEnabled = true
+
+        #expect(AppPreferences(defaults: defaults).visualContextEnabled)
+        preferences.visualContextEnabled = false
+        #expect(!AppPreferences(defaults: defaults).visualContextEnabled)
+    }
+
 }
